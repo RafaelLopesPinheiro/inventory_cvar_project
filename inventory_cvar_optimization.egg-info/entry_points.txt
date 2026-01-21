@@ -1,0 +1,3 @@
+[console_scripts]
+run-experiment = scripts.run_experiment:main
+run-multi-store = scripts.run_multi_store_experiment:main
