@@ -337,13 +337,14 @@ def create_temporal_splits(
 # =============================================================================
 
 def create_sequences(
-    X: np.ndarray, 
-    y: np.ndarray, 
-    seq_length: int
+    X: np.ndarray,
+    y: np.ndarray,
+    seq_length: int,
+    prediction_horizon: int = 30
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Create sequences for LSTM/Transformer models.
-    
+
     Parameters
     ----------
     X : np.ndarray
@@ -352,53 +353,58 @@ def create_sequences(
         Target values of shape (n_samples,).
     seq_length : int
         Length of input sequences (lookback window).
-        
+    prediction_horizon : int
+        Number of days ahead to predict (default 30).
+
     Returns
     -------
     Tuple[np.ndarray, np.ndarray]
-        X_seq: shape (n_samples - seq_length, seq_length, n_features)
-        y_seq: shape (n_samples - seq_length,)
+        X_seq: shape (n_samples - seq_length - prediction_horizon + 1, seq_length, n_features)
+        y_seq: shape (n_samples - seq_length - prediction_horizon + 1,)
     """
     X_seq, y_seq = [], []
-    for i in range(seq_length, len(X)):
+    for i in range(seq_length, len(X) - prediction_horizon + 1):
         X_seq.append(X[i - seq_length:i])
-        y_seq.append(y[i])
+        y_seq.append(y[i + prediction_horizon - 1])
     return np.array(X_seq), np.array(y_seq)
 
 
 def prepare_sequence_data(
     splits: TemporalSplits,
-    seq_length: int = 28
+    seq_length: int = 28,
+    prediction_horizon: int = 30
 ) -> SequenceData:
     """
     Prepare sequence data for deep learning models.
-    
+
     For calibration and test sets, we include historical data from previous
     splits to create complete sequences.
-    
+
     Parameters
     ----------
     splits : TemporalSplits
         Train/calibration/test splits.
     seq_length : int
         Sequence length (lookback window).
-        
+    prediction_horizon : int
+        Number of days ahead to predict (default 30).
+
     Returns
     -------
     SequenceData
         Container with sequence data for all splits.
     """
-    logger.info(f"Preparing sequence data with seq_length={seq_length}")
-    
+    logger.info(f"Preparing sequence data with seq_length={seq_length}, prediction_horizon={prediction_horizon}")
+
     # Combine all data for sequence creation
     X_all = np.vstack([splits.train.X, splits.calibration.X, splits.test.X])
     y_all = np.concatenate([splits.train.y, splits.calibration.y, splits.test.y])
-    
+
     # Create sequences from all data
-    X_seq_all, y_seq_all = create_sequences(X_all, y_all, seq_length)
+    X_seq_all, y_seq_all = create_sequences(X_all, y_all, seq_length, prediction_horizon)
     
-    # Calculate split indices (accounting for sequence length reduction)
-    n_train = len(splits.train.y) - seq_length
+    # Calculate split indices (accounting for sequence length and prediction horizon)
+    n_train = len(splits.train.y) - seq_length - prediction_horizon + 1
     n_cal = len(splits.calibration.y)
     n_test = len(splits.test.y)
     

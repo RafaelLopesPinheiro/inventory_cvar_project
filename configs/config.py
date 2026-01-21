@@ -36,18 +36,21 @@ class DataConfig:
     filepath: str = "train.csv"
     store_ids: List[int] = field(default_factory=lambda: [1])
     item_ids: List[int] = field(default_factory=lambda: [1])
-    
+
     # Temporal splits
     train_years: List[int] = field(default_factory=lambda: [2013, 2014])
     cal_years: List[int] = field(default_factory=lambda: [2015, 2016])
     test_years: List[int] = field(default_factory=lambda: [2017])
-    
+
     # Feature engineering
     lag_features: List[int] = field(default_factory=lambda: [1, 7, 28])
     rolling_windows: List[int] = field(default_factory=lambda: [7, 28])
-    
+
     # Sequence length for DL models
     sequence_length: int = 28
+
+    # Prediction horizon (days ahead to predict)
+    prediction_horizon: int = 30
 
 
 # =============================================================================

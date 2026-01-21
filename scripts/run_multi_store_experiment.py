@@ -72,7 +72,11 @@ def run_single_store_item(
         splits = create_temporal_splits(df, feature_cols)
         
         # Prepare sequence data
-        seq_data = prepare_sequence_data(splits, seq_length=config.data.sequence_length)
+        seq_data = prepare_sequence_data(
+            splits,
+            seq_length=config.data.sequence_length,
+            prediction_horizon=config.data.prediction_horizon
+        )
         
         results = {}
         costs = config.cost
