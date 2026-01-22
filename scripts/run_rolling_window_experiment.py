@@ -177,7 +177,8 @@ def run_window_experiment(
     saa_model = SampleAverageApproximation(
         n_estimators=100,
         max_depth=10,
-        critical_ratio=costs.critical_ratio,
+        stockout_cost=costs.stockout_cost,    # ✅ Correct
+        holding_cost=costs.holding_cost,      # ✅ Correct
         random_state=config.random_seed
     )
     saa_model.fit(X_train, y_train, X_cal, y_cal)
@@ -309,7 +310,7 @@ def run_window_experiment(
             'CVaR-95': result.inventory_metrics.cvar_95,
             'Service_Level': result.inventory_metrics.service_level,
             'Coverage': result.forecast_metrics.coverage if result.forecast_metrics.coverage is not None else np.nan,
-            'Interval_Width': result.forecast_metrics.interval_width if result.forecast_metrics.interval_width is not None else np.nan,
+            'Interval_Width': result.forecast_metrics.avg_interval_width if result.forecast_metrics.avg_interval_width is not None else np.nan,
             'MAE': result.forecast_metrics.mae,
             'RMSE': result.forecast_metrics.rmse,
             'MAPE': result.forecast_metrics.mape,
