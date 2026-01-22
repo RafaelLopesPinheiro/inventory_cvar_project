@@ -704,3 +704,335 @@ class MCDropoutLSTM(BaseDeepLearningForecaster):
             lower=raw.lower - self.calibration_adjustment,
             upper=raw.upper + self.calibration_adjustment
         )
+
+
+# =============================================================================
+# TEMPORAL FUSION TRANSFORMER (TFT)
+# =============================================================================
+
+class GatedResidualNetwork(nn.Module):
+    """
+    Gated Residual Network (GRN) from TFT paper.
+    
+    Applies ELU activation, dropout, linear layer, and gating mechanism.
+    """
+    
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.elu = nn.ELU()
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Linear(hidden_size, hidden_size)
+        self.layernorm = nn.LayerNorm(hidden_size)
+        
+        # Skip connection
+        if input_size != hidden_size:
+            self.skip = nn.Linear(input_size, hidden_size)
+        else:
+            self.skip = None
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Store input for skip connection
+        residual = x if self.skip is None else self.skip(x)
+        
+        # Main path
+        out = self.fc1(x)
+        out = self.elu(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        
+        # Gating mechanism (GLU-style)
+        gate = torch.sigmoid(self.gate(out))
+        out = out * gate
+        
+        # Add residual and normalize
+        out = self.layernorm(out + residual)
+        return out
+
+
+class VariableSelectionNetwork(nn.Module):
+    """
+    Variable Selection Network from TFT.
+    
+    Learns to select relevant features using softmax attention.
+    """
+    
+    def __init__(self, input_size: int, num_features: int, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.hidden_size = hidden_size
+        
+        # Feature-specific GRNs
+        self.feature_grns = nn.ModuleList([
+            GatedResidualNetwork(input_size, hidden_size, dropout)
+            for _ in range(num_features)
+        ])
+        
+        # Variable selection weights
+        self.softmax_grn = GatedResidualNetwork(input_size * num_features, num_features, dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, num_features, input_size)
+        Returns: (batch, seq_len, hidden_size)
+        """
+        batch_size, seq_len, num_features, input_size = x.shape
+        
+        # Flatten batch and sequence dimensions
+        x_flat = x.view(batch_size * seq_len, num_features, input_size)
+        
+        # Process each feature through its GRN
+        processed_features = []
+        for i, grn in enumerate(self.feature_grns):
+            feat = grn(x_flat[:, i, :])
+            processed_features.append(feat)
+        processed_features = torch.stack(processed_features, dim=1)  # (batch*seq, num_feat, hidden)
+        
+        # Compute selection weights
+        concatenated = x_flat.view(batch_size * seq_len, -1)  # (batch*seq, num_feat * input_size)
+        weights = self.softmax_grn(concatenated)  # (batch*seq, num_features)
+        weights = torch.softmax(weights, dim=-1).unsqueeze(-1)  # (batch*seq, num_features, 1)
+        
+        # Apply weights
+        selected = (processed_features * weights).sum(dim=1)  # (batch*seq, hidden)
+        
+        # Reshape back
+        selected = selected.view(batch_size, seq_len, self.hidden_size)
+        return selected
+
+
+class TemporalFusionTransformerNet(nn.Module):
+    """
+    Temporal Fusion Transformer (TFT) network for quantile forecasting.
+    
+    Simplified implementation with key TFT components:
+    - Variable Selection Networks
+    - Gated Residual Networks
+    - Multi-head attention
+    - Quantile outputs
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        quantiles: List[float] = [0.025, 0.5, 0.975]
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.quantiles = quantiles
+        
+        # Input processing: treat each time step as a feature
+        self.input_embedding = nn.Linear(input_size, hidden_size)
+        
+        # LSTM for temporal encoding
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            dropout=0
+        )
+        
+        # Multi-head attention for temporal fusion
+        self.attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=hidden_size,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # GRNs for processing
+        self.grns = nn.ModuleList([
+            GatedResidualNetwork(hidden_size, hidden_size, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Position encoding
+        self.pos_encoder = PositionalEncoding(hidden_size, max_len=100)
+        
+        # Quantile output heads
+        self.quantile_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, len(quantiles))
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, seq_len, input_size)
+        Returns: (batch, num_quantiles)
+        """
+        # Input embedding
+        x = self.input_embedding(x)  # (batch, seq_len, hidden)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # LSTM encoding
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden)
+        
+        # Multi-head attention layers with GRN
+        for attention, grn in zip(self.attention_layers, self.grns):
+            # Self-attention
+            attn_out, _ = attention(lstm_out, lstm_out, lstm_out)
+            
+            # Apply GRN with residual
+            lstm_out = grn(attn_out + lstm_out)
+        
+        # Global pooling
+        pooled = lstm_out.mean(dim=1)  # (batch, hidden)
+        
+        # Quantile predictions
+        quantiles = self.quantile_head(pooled)  # (batch, num_quantiles)
+        
+        return quantiles
+
+
+class TemporalFusionTransformer(BaseDeepLearningForecaster):
+    """
+    Temporal Fusion Transformer for multi-horizon probabilistic forecasting.
+    
+    TFT combines:
+    - Variable selection for interpretability
+    - LSTM for local processing
+    - Multi-head attention for long-range dependencies
+    - Quantile outputs for uncertainty
+    
+    Reference: Lim et al. (2021) "Temporal Fusion Transformers for 
+    Interpretable Multi-horizon Time Series Forecasting"
+    """
+    
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        sequence_length: int = 28,
+        hidden_size: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        learning_rate: float = 0.001,
+        epochs: int = 100,
+        batch_size: int = 32,
+        random_state: int = 42,
+        device: str = "cpu"
+    ):
+        super().__init__(
+            alpha=alpha,
+            sequence_length=sequence_length,
+            random_state=random_state,
+            device=device
+        )
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+        
+        self.quantiles = [alpha / 2, 0.5, 1 - alpha / 2]
+        self.model: Optional[TemporalFusionTransformerNet] = None
+    
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "TemporalFusionTransformer":
+        """Train TFT and calibrate prediction intervals."""
+        logger.info("Training Temporal Fusion Transformer...")
+        logger.info(f"Architecture: {self.num_layers} layers, {self.num_heads} heads, hidden_size={self.hidden_size}")
+        
+        # Set random seed
+        torch.manual_seed(self.random_state)
+        
+        # Normalize features
+        X_train_norm = self._normalize(X_train, fit=True)
+        
+        # Convert to tensors
+        X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
+        y_tensor = torch.FloatTensor(y_train).to(self.device)
+        
+        # Create data loader
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        # Initialize model
+        input_size = X_train.shape[2]
+        self.model = TemporalFusionTransformerNet(
+            input_size=input_size,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            quantiles=self.quantiles
+        ).to(self.device)
+        
+        # Loss and optimizer
+        criterion = QuantileLoss(self.quantiles)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        
+        # Training loop
+        self.model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+            
+            avg_loss = epoch_loss / len(dataloader)
+            self.training_losses.append(avg_loss)
+            scheduler.step(avg_loss)
+            
+            if (epoch + 1) % 20 == 0:
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
+        
+        # Calibration
+        logger.info("Applying conformal calibration...")
+        self._calibrate(X_cal, y_cal)
+        
+        self._is_fitted = True
+        return self
+    
+    def _predict_raw(self, X: np.ndarray) -> PredictionResult:
+        """Generate raw (uncalibrated) predictions."""
+        self.model.eval()
+        X_norm = self._normalize(X)
+        X_tensor = torch.FloatTensor(X_norm).to(self.device)
+        
+        with torch.no_grad():
+            predictions = self.model(X_tensor).cpu().numpy()
+        
+        return PredictionResult(
+            point=predictions[:, 1],  # Median
+            lower=predictions[:, 0],
+            upper=predictions[:, 2]
+        )
+    
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """Generate calibrated predictions."""
+        self._check_is_fitted()
+        
+        raw = self._predict_raw(X)
+        
+        return PredictionResult(
+            point=raw.point,
+            lower=raw.lower - self.calibration_adjustment,
+            upper=raw.upper + self.calibration_adjustment
+        )

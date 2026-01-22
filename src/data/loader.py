@@ -39,12 +39,31 @@ class TemporalSplits:
     calibration: DataSplit
     test: DataSplit
     feature_names: List[str]
-    
+
     def summary(self) -> str:
         return (
             f"Train: {len(self.train)} samples | "
             f"Calibration: {len(self.calibration)} samples | "
             f"Test: {len(self.test)} samples"
+        )
+
+
+@dataclass
+class RollingWindowSplit:
+    """Container for a single rolling window split."""
+    train: DataSplit
+    calibration: DataSplit
+    test: DataSplit
+    window_idx: int
+    test_start_date: pd.Timestamp
+    test_end_date: pd.Timestamp
+    feature_names: List[str]
+
+    def summary(self) -> str:
+        return (
+            f"Window {self.window_idx}: "
+            f"Train={len(self.train)}, Cal={len(self.calibration)}, Test={len(self.test)} | "
+            f"Test period: {self.test_start_date.date()} to {self.test_end_date.date()}"
         )
 
 
@@ -328,7 +347,121 @@ def create_temporal_splits(
     )
     
     logger.info(splits.summary())
-    
+
+    return splits
+
+
+def create_rolling_window_splits(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    initial_train_days: int = 730,  # 2 years
+    calibration_days: int = 365,     # 1 year
+    test_window_days: int = 30,      # 1 month prediction
+    step_days: int = 30              # Roll forward by 1 month
+) -> List[RollingWindowSplit]:
+    """
+    Create rolling window splits for time series cross-validation.
+
+    This function creates multiple train/calibration/test splits by sliding
+    a window through time. Each window predicts the next month.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Processed dataframe with features and date column.
+    feature_cols : List[str]
+        List of feature column names.
+    initial_train_days : int
+        Number of days in initial training period (default 730 = 2 years).
+    calibration_days : int
+        Number of days for calibration period (default 365 = 1 year).
+    test_window_days : int
+        Number of days to predict ahead (default 30 = 1 month).
+    step_days : int
+        Number of days to roll forward for each window (default 30 = 1 month).
+
+    Returns
+    -------
+    List[RollingWindowSplit]
+        List of rolling window splits, one for each time window.
+
+    Examples
+    --------
+    With initial_train=730, cal=365, test=30, step=30:
+    - Window 0: Train days 0-729, Cal days 730-1094, Test days 1095-1124
+    - Window 1: Train days 30-759, Cal days 760-1124, Test days 1125-1154
+    - Window 2: Train days 60-789, Cal days 790-1154, Test days 1155-1184
+    - ...
+    """
+    logger.info("Creating rolling window splits...")
+    logger.info(f"  Initial train: {initial_train_days} days")
+    logger.info(f"  Calibration: {calibration_days} days")
+    logger.info(f"  Test window: {test_window_days} days")
+    logger.info(f"  Step size: {step_days} days")
+
+    # Ensure data is sorted by date
+    df = df.sort_values('date').reset_index(drop=True)
+
+    splits = []
+    window_idx = 0
+
+    # Start position for first window
+    start_pos = 0
+
+    while True:
+        # Calculate split positions
+        train_end = start_pos + initial_train_days
+        cal_end = train_end + calibration_days
+        test_end = cal_end + test_window_days
+
+        # Check if we have enough data
+        if test_end > len(df):
+            break
+
+        # Extract data for this window
+        train_df = df.iloc[start_pos:train_end].copy()
+        cal_df = df.iloc[train_end:cal_end].copy()
+        test_df = df.iloc[cal_end:test_end].copy()
+
+        # Create DataSplit objects
+        train_split = DataSplit(
+            X=train_df[feature_cols].values,
+            y=train_df['sales'].values,
+            dates=train_df['date'].values
+        )
+
+        cal_split = DataSplit(
+            X=cal_df[feature_cols].values,
+            y=cal_df['sales'].values,
+            dates=cal_df['date'].values
+        )
+
+        test_split = DataSplit(
+            X=test_df[feature_cols].values,
+            y=test_df['sales'].values,
+            dates=test_df['date'].values
+        )
+
+        # Create rolling window split
+        rolling_split = RollingWindowSplit(
+            train=train_split,
+            calibration=cal_split,
+            test=test_split,
+            window_idx=window_idx,
+            test_start_date=test_df['date'].iloc[0],
+            test_end_date=test_df['date'].iloc[-1],
+            feature_names=feature_cols
+        )
+
+        splits.append(rolling_split)
+        logger.info(f"  {rolling_split.summary()}")
+
+        # Move to next window
+        start_pos += step_days
+        window_idx += 1
+
+    logger.info(f"Created {len(splits)} rolling window splits")
+
     return splits
 
 
@@ -422,6 +555,61 @@ def prepare_sequence_data(
     logger.info(f"Calibration sequences: {X_cal_seq.shape}")
     logger.info(f"Test sequences: {X_test_seq.shape}")
     
+    return SequenceData(
+        X_train=X_train_seq,
+        y_train=y_train_seq,
+        X_cal=X_cal_seq,
+        y_cal=y_cal_seq,
+        X_test=X_test_seq,
+        y_test=y_test_seq,
+        sequence_length=seq_length
+    )
+
+
+def prepare_rolling_sequence_data(
+    rolling_split: RollingWindowSplit,
+    seq_length: int = 28,
+    prediction_horizon: int = 30
+) -> SequenceData:
+    """
+    Prepare sequence data for a single rolling window split.
+
+    Parameters
+    ----------
+    rolling_split : RollingWindowSplit
+        A single rolling window split.
+    seq_length : int
+        Sequence length (lookback window).
+    prediction_horizon : int
+        Number of days ahead to predict.
+
+    Returns
+    -------
+    SequenceData
+        Container with sequence data for this window.
+    """
+    # Combine all data for sequence creation
+    X_all = np.vstack([rolling_split.train.X, rolling_split.calibration.X, rolling_split.test.X])
+    y_all = np.concatenate([rolling_split.train.y, rolling_split.calibration.y, rolling_split.test.y])
+
+    # Create sequences from all data
+    X_seq_all, y_seq_all = create_sequences(X_all, y_all, seq_length, prediction_horizon)
+
+    # Calculate split indices
+    n_train = len(rolling_split.train.y) - seq_length - prediction_horizon + 1
+    n_cal = len(rolling_split.calibration.y)
+    n_test = len(rolling_split.test.y)
+
+    # Split back into train/cal/test
+    X_train_seq = X_seq_all[:n_train]
+    y_train_seq = y_seq_all[:n_train]
+
+    X_cal_seq = X_seq_all[n_train:n_train + n_cal]
+    y_cal_seq = y_seq_all[n_train:n_train + n_cal]
+
+    X_test_seq = X_seq_all[n_train + n_cal:n_train + n_cal + n_test]
+    y_test_seq = y_seq_all[n_train + n_cal:n_train + n_cal + n_test]
+
     return SequenceData(
         X_train=X_train_seq,
         y_train=y_train_seq,
@@ -544,3 +732,69 @@ def load_multi_store_data(
     
     logger.info(f"Successfully loaded {len(results)} store-item combinations")
     return results
+
+
+def load_and_prepare_rolling_data(
+    filepath: str,
+    store_id: int = 1,
+    item_id: int = 1,
+    lag_periods: List[int] = [1, 7, 28],
+    rolling_windows: List[int] = [7, 28],
+    initial_train_days: int = 730,
+    calibration_days: int = 365,
+    test_window_days: int = 30,
+    step_days: int = 30
+) -> List[RollingWindowSplit]:
+    """
+    Convenience function to load and prepare rolling window data.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the CSV file.
+    store_id : int
+        Store ID to filter.
+    item_id : int
+        Item ID to filter.
+    lag_periods : List[int]
+        Lag periods for features.
+    rolling_windows : List[int]
+        Rolling window sizes.
+    initial_train_days : int
+        Initial training period in days.
+    calibration_days : int
+        Calibration period in days.
+    test_window_days : int
+        Test window size in days.
+    step_days : int
+        Step size for rolling windows.
+
+    Returns
+    -------
+    List[RollingWindowSplit]
+        List of rolling window splits.
+    """
+    # Load raw data
+    df = load_raw_data(filepath)
+
+    # Filter for specific store/item
+    df = filter_store_item(df, store_id, item_id)
+
+    # Create features
+    df, feature_cols = create_all_features(
+        df,
+        lag_periods=lag_periods,
+        rolling_windows=rolling_windows
+    )
+
+    # Create rolling window splits
+    splits = create_rolling_window_splits(
+        df,
+        feature_cols,
+        initial_train_days=initial_train_days,
+        calibration_days=calibration_days,
+        test_window_days=test_window_days,
+        step_days=step_days
+    )
+
+    return splits

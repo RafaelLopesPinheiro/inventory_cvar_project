@@ -25,9 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data import (
     load_and_prepare_data,
+    load_and_prepare_rolling_data,
     prepare_sequence_data,
+    prepare_rolling_sequence_data,
     TemporalSplits,
     SequenceData,
+    RollingWindowSplit,
 )
 from src.models import (
     ConformalPrediction,
@@ -39,6 +42,7 @@ from src.models import (
     TransformerQuantileRegression,
     DeepEnsemble,
     MCDropoutLSTM,
+    TemporalFusionTransformer,
     PredictionResult,
 )
 from src.optimization import (
@@ -420,7 +424,47 @@ def run_deep_learning_methods(
         costs.ordering_cost, costs.holding_cost, costs.stockout_cost
     )
     training_losses["MCDropout_LSTM"] = []
-    
+
+    # =========================================================================
+    # METHOD: Temporal Fusion Transformer
+    # =========================================================================
+    logger.info("=" * 70)
+    logger.info("METHOD: TEMPORAL FUSION TRANSFORMER (TFT)")
+    logger.info("=" * 70)
+
+    tft_model = TemporalFusionTransformer(
+        alpha=config.tft.alpha,
+        sequence_length=config.data.sequence_length,
+        hidden_size=config.tft.hidden_size,
+        num_heads=config.tft.num_heads,
+        num_layers=config.tft.num_layers,
+        dropout=config.tft.dropout,
+        learning_rate=config.tft.learning_rate,
+        epochs=config.tft.epochs,
+        batch_size=config.tft.batch_size,
+        random_state=config.random_seed,
+        device=config.device
+    )
+    tft_model.fit(X_train, y_train, X_cal, y_cal)
+    tft_pred = tft_model.predict(X_test)
+
+    tft_orders = compute_order_quantities_cvar(
+        tft_pred.point, tft_pred.lower, tft_pred.upper,
+        beta=config.cvar.beta,
+        n_samples=config.cvar.n_samples,
+        ordering_cost=costs.ordering_cost,
+        holding_cost=costs.holding_cost,
+        stockout_cost=costs.stockout_cost,
+        random_seed=config.cvar.random_seed
+    )
+
+    results["TFT"] = compute_all_metrics(
+        "TFT", y_test, tft_pred.point, tft_orders,
+        tft_pred.lower, tft_pred.upper,
+        costs.ordering_cost, costs.holding_cost, costs.stockout_cost
+    )
+    training_losses["TFT"] = tft_model.training_losses
+
     return results, training_losses
 
 
@@ -449,7 +493,7 @@ def print_key_findings(results_dict: Dict[str, MethodResults]):
     logger.info(f"[BEST] Lowest Mean Cost: {best_mean[0]} (${best_mean[1].inventory_metrics.mean_cost:.2f})")
     
     # DL vs Traditional comparison
-    dl_methods = ["LSTM_QR", "Transformer_QR", "DeepEnsemble", "MCDropout_LSTM"]
+    dl_methods = ["LSTM_QR", "Transformer_QR", "DeepEnsemble", "MCDropout_LSTM", "TFT"]
     trad_methods = ["Conformal_CVaR", "Normal_CVaR", "QuantileReg_CVaR", "SAA"]
     
     dl_cvar90 = np.mean([
@@ -618,8 +662,9 @@ if __name__ == "__main__":
         config.lstm.epochs = args.epochs
         config.transformer.epochs = args.epochs
         config.mc_dropout.epochs = args.epochs
-    
+        config.tft.epochs = args.epochs
+
     if args.device:
         config.device = args.device
-    
+
     main(config)

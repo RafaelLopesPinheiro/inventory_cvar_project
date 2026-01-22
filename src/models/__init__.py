@@ -15,6 +15,7 @@ from .deep_learning import (
     TransformerQuantileRegression,
     DeepEnsemble,
     MCDropoutLSTM,
+    TemporalFusionTransformer,
     QuantileLoss,
 )
 
@@ -36,5 +37,6 @@ __all__ = [
     "TransformerQuantileRegression",
     "DeepEnsemble",
     "MCDropoutLSTM",
+    "TemporalFusionTransformer",
     "QuantileLoss",
 ]

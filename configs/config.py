@@ -134,6 +134,33 @@ class MCDropoutConfig:
     n_mc_samples: int = 100
 
 
+@dataclass
+class TFTConfig:
+    """Temporal Fusion Transformer settings."""
+    alpha: float = 0.05
+    hidden_size: int = 64
+    num_heads: int = 4
+    num_layers: int = 2
+    dropout: float = 0.1
+    learning_rate: float = 0.001
+    epochs: int = 100
+    batch_size: int = 32
+
+
+# =============================================================================
+# ROLLING WINDOW CONFIGURATION
+# =============================================================================
+
+@dataclass
+class RollingWindowConfig:
+    """Rolling window split settings."""
+    enabled: bool = False  # Set to True to use rolling windows
+    initial_train_days: int = 730  # 2 years
+    calibration_days: int = 365     # 1 year
+    test_window_days: int = 30      # 1 month prediction
+    step_days: int = 30             # Roll forward by 1 month
+
+
 # =============================================================================
 # OPTIMIZATION CONFIGURATION
 # =============================================================================
@@ -157,7 +184,8 @@ class ExperimentConfig:
     cost: CostConfig = field(default_factory=CostConfig)
     data: DataConfig = field(default_factory=DataConfig)
     cvar: CVaRConfig = field(default_factory=CVaRConfig)
-    
+    rolling_window: RollingWindowConfig = field(default_factory=RollingWindowConfig)
+
     # Model configs
     conformal: ConformalConfig = field(default_factory=ConformalConfig)
     normal: NormalConfig = field(default_factory=NormalConfig)
@@ -166,11 +194,12 @@ class ExperimentConfig:
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
     deep_ensemble: DeepEnsembleConfig = field(default_factory=DeepEnsembleConfig)
     mc_dropout: MCDropoutConfig = field(default_factory=MCDropoutConfig)
-    
+    tft: TFTConfig = field(default_factory=TFTConfig)
+
     # Experiment settings
     random_seed: int = 42
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Output settings
     results_dir: str = "results"
     save_models: bool = True
