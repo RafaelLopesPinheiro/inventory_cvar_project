@@ -900,17 +900,17 @@ class TemporalFusionTransformerNet(nn.Module):
 class TemporalFusionTransformer(BaseDeepLearningForecaster):
     """
     Temporal Fusion Transformer for multi-horizon probabilistic forecasting.
-    
+
     TFT combines:
     - Variable selection for interpretability
     - LSTM for local processing
     - Multi-head attention for long-range dependencies
     - Quantile outputs for uncertainty
-    
-    Reference: Lim et al. (2021) "Temporal Fusion Transformers for 
+
+    Reference: Lim et al. (2021) "Temporal Fusion Transformers for
     Interpretable Multi-horizon Time Series Forecasting"
     """
-    
+
     def __init__(
         self,
         alpha: float = 0.05,
@@ -938,10 +938,10 @@ class TemporalFusionTransformer(BaseDeepLearningForecaster):
         self.learning_rate = learning_rate
         self.epochs = epochs
         self.batch_size = batch_size
-        
+
         self.quantiles = [alpha / 2, 0.5, 1 - alpha / 2]
         self.model: Optional[TemporalFusionTransformerNet] = None
-    
+
     def fit(
         self,
         X_train: np.ndarray,
@@ -952,21 +952,21 @@ class TemporalFusionTransformer(BaseDeepLearningForecaster):
         """Train TFT and calibrate prediction intervals."""
         logger.info("Training Temporal Fusion Transformer...")
         logger.info(f"Architecture: {self.num_layers} layers, {self.num_heads} heads, hidden_size={self.hidden_size}")
-        
+
         # Set random seed
         torch.manual_seed(self.random_state)
-        
+
         # Normalize features
         X_train_norm = self._normalize(X_train, fit=True)
-        
+
         # Convert to tensors
         X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
         y_tensor = torch.FloatTensor(y_train).to(self.device)
-        
+
         # Create data loader
         dataset = TensorDataset(X_tensor, y_tensor)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
+
         # Initialize model
         input_size = X_train.shape[2]
         self.model = TemporalFusionTransformerNet(
@@ -977,12 +977,12 @@ class TemporalFusionTransformer(BaseDeepLearningForecaster):
             dropout=self.dropout,
             quantiles=self.quantiles
         ).to(self.device)
-        
+
         # Loss and optimizer
         criterion = QuantileLoss(self.quantiles)
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-        
+
         # Training loop
         self.model.train()
         for epoch in range(self.epochs):
@@ -995,42 +995,331 @@ class TemporalFusionTransformer(BaseDeepLearningForecaster):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 epoch_loss += loss.item()
-            
+
             avg_loss = epoch_loss / len(dataloader)
             self.training_losses.append(avg_loss)
             scheduler.step(avg_loss)
-            
+
             if (epoch + 1) % 20 == 0:
                 logger.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
-        
+
         # Calibration
         logger.info("Applying conformal calibration...")
         self._calibrate(X_cal, y_cal)
-        
+
         self._is_fitted = True
         return self
-    
+
     def _predict_raw(self, X: np.ndarray) -> PredictionResult:
         """Generate raw (uncalibrated) predictions."""
         self.model.eval()
         X_norm = self._normalize(X)
         X_tensor = torch.FloatTensor(X_norm).to(self.device)
-        
+
         with torch.no_grad():
             predictions = self.model(X_tensor).cpu().numpy()
-        
+
         return PredictionResult(
             point=predictions[:, 1],  # Median
             lower=predictions[:, 0],
             upper=predictions[:, 2]
         )
-    
+
     def predict(self, X: np.ndarray) -> PredictionResult:
         """Generate calibrated predictions."""
         self._check_is_fitted()
-        
+
         raw = self._predict_raw(X)
-        
+
+        return PredictionResult(
+            point=raw.point,
+            lower=raw.lower - self.calibration_adjustment,
+            upper=raw.upper + self.calibration_adjustment
+        )
+
+
+# =============================================================================
+# SPO/END-TO-END BASELINE
+# =============================================================================
+
+class SPOLoss(nn.Module):
+    """
+    Smart Predict-then-Optimize (SPO) loss function.
+
+    Directly optimizes the downstream newsvendor decision cost.
+    This is a decision-focused learning approach that trains models
+    to minimize the actual inventory cost rather than prediction error.
+
+    Reference: Elmachtoub & Grigas (2017) "Smart 'Predict, then Optimize'"
+    """
+
+    def __init__(
+        self,
+        ordering_cost: float = 10.0,
+        holding_cost: float = 2.0,
+        stockout_cost: float = 50.0,
+        beta: float = 0.90,
+        n_samples: int = 100
+    ):
+        super().__init__()
+        self.ordering_cost = ordering_cost
+        self.holding_cost = holding_cost
+        self.stockout_cost = stockout_cost
+        self.beta = beta
+        self.n_samples = n_samples
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute SPO loss based on newsvendor cost.
+
+        Parameters
+        ----------
+        predictions : torch.Tensor, shape (batch, 3)
+            Predicted quantiles [lower, median, upper]
+        targets : torch.Tensor, shape (batch,)
+            Actual demand values
+
+        Returns
+        -------
+        torch.Tensor
+            Mean newsvendor cost (decision loss)
+        """
+        batch_size = predictions.shape[0]
+
+        # Extract quantile predictions
+        lower_pred = predictions[:, 0]
+        point_pred = predictions[:, 1]
+        upper_pred = predictions[:, 2]
+
+        # Compute order quantities using predicted distribution
+        # For simplicity, use the median as order quantity
+        # In practice, we could sample from the predicted interval
+        order_qty = point_pred
+
+        # Compute newsvendor loss for each sample
+        overage = torch.clamp(order_qty - targets, min=0)
+        underage = torch.clamp(targets - order_qty, min=0)
+
+        cost = (
+            self.ordering_cost * order_qty +
+            self.holding_cost * overage +
+            self.stockout_cost * underage
+        )
+
+        # Return mean cost as the loss
+        return cost.mean()
+
+
+class SPONet(nn.Module):
+    """
+    Neural network for SPO/End-to-End learning.
+
+    Outputs quantile predictions that will be optimized
+    to minimize downstream newsvendor costs.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        quantiles: List[float] = [0.025, 0.5, 0.975]
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.quantiles = quantiles
+
+        # LSTM backbone
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        # Output layers for quantile predictions
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, len(quantiles))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch, seq_len, features)
+
+        Returns
+        -------
+        torch.Tensor, shape (batch, n_quantiles)
+            Quantile predictions
+        """
+        lstm_out, _ = self.lstm(x)
+        last_out = lstm_out[:, -1, :]
+        out = self.dropout(last_out)
+        return self.fc(out)
+
+
+class SPOEndToEnd(BaseDeepLearningForecaster):
+    """
+    SPO/End-to-End Baseline for Inventory Optimization.
+
+    This model directly optimizes the downstream decision cost (newsvendor loss)
+    rather than prediction accuracy. It represents the critical competitor to
+    traditional predict-then-optimize approaches.
+
+    Key differences from traditional approaches:
+    - Loss function: Newsvendor cost instead of MSE/quantile loss
+    - Objective: Minimize inventory costs directly
+    - Decision-focused: Learns predictions that lead to better decisions
+
+    References:
+    - Elmachtoub & Grigas (2017) "Smart 'Predict, then Optimize'"
+    - Donti et al. (2017) "Task-based End-to-end Model Learning"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        sequence_length: int = 28,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        learning_rate: float = 0.001,
+        epochs: int = 100,
+        batch_size: int = 32,
+        ordering_cost: float = 10.0,
+        holding_cost: float = 2.0,
+        stockout_cost: float = 50.0,
+        beta: float = 0.90,
+        random_state: int = 42,
+        device: str = "cpu"
+    ):
+        super().__init__(
+            alpha=alpha,
+            sequence_length=sequence_length,
+            random_state=random_state,
+            device=device
+        )
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+
+        # Cost parameters for newsvendor problem
+        self.ordering_cost = ordering_cost
+        self.holding_cost = holding_cost
+        self.stockout_cost = stockout_cost
+        self.beta = beta
+
+        self.quantiles = [alpha / 2, 0.5, 1 - alpha / 2]
+        self.model: Optional[SPONet] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "SPOEndToEnd":
+        """Train SPO model by minimizing newsvendor costs."""
+        logger.info("Training SPO/End-to-End Baseline...")
+        logger.info(f"Decision-focused learning with newsvendor costs")
+        logger.info(f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}")
+
+        # Set random seed
+        torch.manual_seed(self.random_state)
+
+        # Normalize features
+        X_train_norm = self._normalize(X_train, fit=True)
+
+        # Convert to tensors
+        X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
+        y_tensor = torch.FloatTensor(y_train).to(self.device)
+
+        # Create data loader
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        # Initialize model
+        input_size = X_train.shape[2]
+        self.model = SPONet(
+            input_size=input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            quantiles=self.quantiles
+        ).to(self.device)
+
+        # SPO loss function (decision-focused)
+        criterion = SPOLoss(
+            ordering_cost=self.ordering_cost,
+            holding_cost=self.holding_cost,
+            stockout_cost=self.stockout_cost,
+            beta=self.beta
+        )
+
+        # Optimizer
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+        # Training loop
+        self.model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(dataloader)
+            self.training_losses.append(avg_loss)
+            scheduler.step(avg_loss)
+
+            if (epoch + 1) % 20 == 0:
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Cost: ${avg_loss:.2f}")
+
+        # Calibration
+        logger.info("Applying conformal calibration...")
+        self._calibrate(X_cal, y_cal)
+
+        self._is_fitted = True
+        return self
+
+    def _predict_raw(self, X: np.ndarray) -> PredictionResult:
+        """Generate raw (uncalibrated) predictions."""
+        self.model.eval()
+        X_norm = self._normalize(X)
+        X_tensor = torch.FloatTensor(X_norm).to(self.device)
+
+        with torch.no_grad():
+            predictions = self.model(X_tensor).cpu().numpy()
+
+        return PredictionResult(
+            point=predictions[:, 1],  # Median
+            lower=predictions[:, 0],
+            upper=predictions[:, 2]
+        )
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """Generate calibrated predictions."""
+        self._check_is_fitted()
+
+        raw = self._predict_raw(X)
+
         return PredictionResult(
             point=raw.point,
             lower=raw.lower - self.calibration_adjustment,
