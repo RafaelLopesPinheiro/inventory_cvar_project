@@ -177,14 +177,15 @@ def run_window_experiment(
     saa_model = SampleAverageApproximation(
         n_estimators=100,
         max_depth=10,
-        stockout_cost=costs.stockout_cost,    # ✅ Correct
-        holding_cost=costs.holding_cost,      # ✅ Correct
+        stockout_cost=costs.stockout_cost,    
+        holding_cost=costs.holding_cost,      
         random_state=config.random_seed
     )
     saa_model.fit(X_train, y_train, X_cal, y_cal)
     saa_pred = saa_model.predict(X_test)
+    saa_orders = saa_model.compute_order_quantities(X_test)  # Compute SAA-optimal orders
     results["SAA"] = compute_all_metrics(
-        "SAA", y_test, saa_pred.point, saa_pred.point,
+        "SAA", y_test, saa_pred.point, saa_orders,  # Use computed orders
         None, None,
         costs.ordering_cost, costs.holding_cost, costs.stockout_cost
     )
