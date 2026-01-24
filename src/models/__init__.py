@@ -8,6 +8,7 @@ from .traditional import (
     QuantileRegression,
     SampleAverageApproximation,
     ExpectedValue,
+    Seer,
 )
 
 from .deep_learning import (
@@ -32,6 +33,7 @@ __all__ = [
     "QuantileRegression",
     "SampleAverageApproximation",
     "ExpectedValue",
+    "Seer",
     
     # Deep learning models
     "LSTMQuantileRegression",

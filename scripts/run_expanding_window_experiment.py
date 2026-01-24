@@ -37,6 +37,7 @@ from src.models import (
     QuantileRegression,
     SampleAverageApproximation,
     ExpectedValue,
+    Seer,
     LSTMQuantileRegression,
     TransformerQuantileRegression,
     DeepEnsemble,
@@ -201,6 +202,31 @@ def run_window_experiment(
     )
 
     # =========================================================================
+    # SEER (PERFECT FORESIGHT ORACLE - THEORETICAL UPPER BOUND)
+    # =========================================================================
+
+    logger.info("Running Seer (Perfect Foresight Oracle)...")
+    seer_model = Seer(alpha=0.05, random_state=config.random_seed)
+    seer_model.fit(X_train, y_train, X_cal, y_cal)
+
+    # Seer uses actual demand as "predictions"
+    seer_pred = seer_model.predict_with_actuals(X_test, y_test)
+
+    # With perfect foresight, order exactly the demand (optimal)
+    seer_orders = seer_model.compute_order_quantities(
+        y_test,
+        ordering_cost=costs.ordering_cost,
+        holding_cost=costs.holding_cost,
+        stockout_cost=costs.stockout_cost
+    )
+
+    results["Seer_Oracle"] = compute_all_metrics(
+        "Seer_Oracle", y_test, seer_pred.point, seer_orders,
+        seer_pred.lower, seer_pred.upper,
+        costs.ordering_cost, costs.holding_cost, costs.stockout_cost
+    )
+
+    # =========================================================================
     # DEEP LEARNING METHODS
     # =========================================================================
 
@@ -337,7 +363,7 @@ def run_window_experiment(
     # =========================================================================
 
     # Align traditional methods to sequence-aligned test data
-    for name in ["Conformal_CVaR", "Normal_CVaR", "QuantileReg_CVaR", "SAA"]:
+    for name in ["Conformal_CVaR", "Normal_CVaR", "QuantileReg_CVaR", "SAA", "Seer_Oracle"]:
         result = results[name]
         results[name] = MethodResults(
             method_name=name,
