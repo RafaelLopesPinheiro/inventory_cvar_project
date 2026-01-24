@@ -52,14 +52,16 @@ def load_results(results_dir: str = "results/expanding_window_spo"):
 def plot_spo_comparison(df_all, df_agg, output_dir):
     """Highlight SPO performance vs other methods."""
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('SPO/End-to-End vs Predict-then-Optimize Methods', fontsize=16, y=1.00)
+    fig.suptitle('SPO/End-to-End vs Predict-then-Optimize Methods (with Seer Oracle)', fontsize=16, y=1.00)
 
     methods = df_all['Method'].unique()
 
-    # Create color map: SPO in red, others in different colors
+    # Create color map: Seer in gold, SPO in red, others in different colors
     colors = []
     for method in methods:
-        if 'SPO' in method:
+        if 'Seer' in method:
+            colors.append('gold')
+        elif 'SPO' in method:
             colors.append('red')
         elif method in ['Conformal_CVaR', 'Normal_CVaR', 'QuantileReg_CVaR', 'SAA']:
             colors.append('steelblue')
@@ -70,14 +72,28 @@ def plot_spo_comparison(df_all, df_agg, output_dir):
     ax = axes[0, 0]
     for i, method in enumerate(methods):
         method_data = df_all[df_all['Method'] == method].sort_values('window_idx')
-        linewidth = 3 if 'SPO' in method else 2
-        linestyle = '-' if 'SPO' in method else '--'
+        # Seer gets thickest line with stars, SPO gets thick solid line
+        if 'Seer' in method:
+            linewidth = 4
+            linestyle = '-'
+            marker = '*'
+            markersize = 10
+        elif 'SPO' in method:
+            linewidth = 3
+            linestyle = '-'
+            marker = 'o'
+            markersize = 6
+        else:
+            linewidth = 2
+            linestyle = '--'
+            marker = 'o'
+            markersize = 6
         ax.plot(method_data['window_idx'], method_data['Mean_Cost'],
-                marker='o', label=method, color=colors[i],
-                linewidth=linewidth, linestyle=linestyle, markersize=6)
+                marker=marker, label=method, color=colors[i],
+                linewidth=linewidth, linestyle=linestyle, markersize=markersize)
     ax.set_xlabel('Window Index', fontsize=12)
     ax.set_ylabel('Mean Cost ($)', fontsize=12)
-    ax.set_title('Mean Cost Evolution (SPO in Red)', fontsize=13, fontweight='bold')
+    ax.set_title('Mean Cost Evolution (Seer=Gold ⭐, SPO=Red)', fontsize=13, fontweight='bold')
     ax.legend(loc='best', fontsize=9)
     ax.grid(alpha=0.3)
 
@@ -85,14 +101,28 @@ def plot_spo_comparison(df_all, df_agg, output_dir):
     ax = axes[0, 1]
     for i, method in enumerate(methods):
         method_data = df_all[df_all['Method'] == method].sort_values('window_idx')
-        linewidth = 3 if 'SPO' in method else 2
-        linestyle = '-' if 'SPO' in method else '--'
+        # Seer gets thickest line with stars, SPO gets thick solid line
+        if 'Seer' in method:
+            linewidth = 4
+            linestyle = '-'
+            marker = '*'
+            markersize = 10
+        elif 'SPO' in method:
+            linewidth = 3
+            linestyle = '-'
+            marker = 's'
+            markersize = 6
+        else:
+            linewidth = 2
+            linestyle = '--'
+            marker = 's'
+            markersize = 6
         ax.plot(method_data['window_idx'], method_data['CVaR-90'],
-                marker='s', label=method, color=colors[i],
-                linewidth=linewidth, linestyle=linestyle, markersize=6)
+                marker=marker, label=method, color=colors[i],
+                linewidth=linewidth, linestyle=linestyle, markersize=markersize)
     ax.set_xlabel('Window Index', fontsize=12)
     ax.set_ylabel('CVaR-90 ($)', fontsize=12)
-    ax.set_title('CVaR-90 Evolution (SPO in Red)', fontsize=13, fontweight='bold')
+    ax.set_title('CVaR-90 Evolution (Seer=Gold ⭐, SPO=Red)', fontsize=13, fontweight='bold')
     ax.legend(loc='best', fontsize=9)
     ax.grid(alpha=0.3)
 
@@ -110,9 +140,13 @@ def plot_spo_comparison(df_all, df_agg, output_dir):
     ax.set_title('Average Mean Cost Across Windows', fontsize=12, fontweight='bold')
     ax.grid(axis='y', alpha=0.3)
 
-    # Highlight SPO
+    # Highlight Seer (oracle) and SPO
     for i, method in enumerate(method_names):
-        if 'SPO' in method:
+        if 'Seer' in method:
+            bars[i].set_edgecolor('darkgoldenrod')
+            bars[i].set_linewidth(4)
+            bars[i].set_hatch('///')
+        elif 'SPO' in method:
             bars[i].set_edgecolor('darkred')
             bars[i].set_linewidth(3)
 
@@ -129,8 +163,13 @@ def plot_spo_comparison(df_all, df_agg, output_dir):
     ax.set_title('Average CVaR-90 Across Windows', fontsize=12, fontweight='bold')
     ax.grid(axis='y', alpha=0.3)
 
+    # Highlight Seer (oracle) and SPO
     for i, method in enumerate(method_names):
-        if 'SPO' in method:
+        if 'Seer' in method:
+            bars[i].set_edgecolor('darkgoldenrod')
+            bars[i].set_linewidth(4)
+            bars[i].set_hatch('///')
+        elif 'SPO' in method:
             bars[i].set_edgecolor('darkred')
             bars[i].set_linewidth(3)
 
@@ -142,9 +181,9 @@ def plot_spo_comparison(df_all, df_agg, output_dir):
 
 
 def plot_spo_ranking(df_agg, output_dir):
-    """Show SPO ranking among all methods."""
+    """Show SPO ranking among all methods including Seer oracle."""
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('SPO/End-to-End Performance Ranking', fontsize=16, y=1.02)
+    fig.suptitle('Performance Ranking (Seer=Oracle, SPO=Decision-Focused)', fontsize=16, y=1.02)
 
     methods = df_agg.index.tolist()
 
@@ -170,8 +209,15 @@ def plot_spo_ranking(df_agg, output_dir):
         sorted_values = values[sorted_idx]
         sorted_stds = stds[sorted_idx]
 
-        # Color: SPO in red, others in gray
-        colors = ['red' if 'SPO' in m else 'steelblue' for m in sorted_methods]
+        # Color: Seer in gold (oracle), SPO in red, others in gray
+        colors = []
+        for m in sorted_methods:
+            if 'Seer' in m:
+                colors.append('gold')
+            elif 'SPO' in m:
+                colors.append('red')
+            else:
+                colors.append('steelblue')
 
         bars = ax.barh(range(len(sorted_methods)), sorted_values,
                       xerr=sorted_stds, capsize=5, color=colors, alpha=0.7)
@@ -181,14 +227,17 @@ def plot_spo_ranking(df_agg, output_dir):
         ax.set_title(f'Ranking by {label}', fontsize=12, fontweight='bold')
         ax.grid(axis='x', alpha=0.3)
 
-        # Add rank numbers
+        # Add rank numbers and highlights
         for i, (method, value) in enumerate(zip(sorted_methods, sorted_values)):
             rank = i + 1
             ax.text(-0.5, i, f'#{rank}', ha='right', va='center',
                    fontweight='bold', fontsize=10)
 
-            # Highlight SPO rank
-            if 'SPO' in method:
+            # Highlight Seer (oracle) and SPO ranks
+            if 'Seer' in method:
+                ax.axhline(i, color='gold', linestyle=':', alpha=0.5, linewidth=3)
+                bars[i].set_hatch('///')
+            elif 'SPO' in method:
                 ax.axhline(i, color='red', linestyle=':', alpha=0.3, linewidth=2)
 
     plt.tight_layout()
@@ -199,14 +248,15 @@ def plot_spo_ranking(df_agg, output_dir):
 
 
 def plot_method_categories_with_spo(df_agg, output_dir):
-    """Compare traditional, DL, and SPO methods."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    fig.suptitle('Traditional vs Deep Learning vs SPO (Decision-Focused)', fontsize=16, y=1.02)
+    """Compare traditional, DL, SPO, and Seer oracle methods."""
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    fig.suptitle('Method Categories: Traditional vs DL vs SPO vs Oracle', fontsize=16, y=1.02)
 
     # Categorize methods
     traditional = ['Conformal_CVaR', 'Normal_CVaR', 'QuantileReg_CVaR', 'SAA']
     deep_learning = ['LSTM_QR', 'Transformer_QR', 'TFT']
     spo_methods = ['SPO_EndToEnd']
+    oracle_methods = ['Seer_Oracle']
 
     metrics = [
         ('Mean_Cost', 'Mean Cost ($)'),
@@ -221,29 +271,45 @@ def plot_method_categories_with_spo(df_agg, output_dir):
         trad_data = df_agg.loc[df_agg.index.isin(traditional), (metric, 'mean')].values
         dl_data = df_agg.loc[df_agg.index.isin(deep_learning), (metric, 'mean')].values
         spo_data = df_agg.loc[df_agg.index.isin(spo_methods), (metric, 'mean')].values
+        oracle_data = df_agg.loc[df_agg.index.isin(oracle_methods), (metric, 'mean')].values
 
         # Compute category averages
         categories = []
         values = []
         colors_cat = []
+        hatches = []
 
         if len(trad_data) > 0:
             categories.append('Traditional\n(Predict-then-\nOptimize)')
             values.append(np.mean(trad_data))
             colors_cat.append('steelblue')
+            hatches.append('')
 
         if len(dl_data) > 0:
             categories.append('Deep Learning\n(Predict-then-\nOptimize)')
             values.append(np.mean(dl_data))
             colors_cat.append('coral')
+            hatches.append('')
 
         if len(spo_data) > 0:
             categories.append('SPO\n(Decision-\nFocused)')
             values.append(np.mean(spo_data))
             colors_cat.append('red')
+            hatches.append('')
+
+        if len(oracle_data) > 0:
+            categories.append('Seer\n(Perfect\nForesight) ⭐')
+            values.append(np.mean(oracle_data))
+            colors_cat.append('gold')
+            hatches.append('///')
 
         bars = ax.bar(range(len(categories)), values, color=colors_cat, alpha=0.8,
                      edgecolor='black', linewidth=2)
+
+        # Apply hatch patterns
+        for bar, hatch in zip(bars, hatches):
+            bar.set_hatch(hatch)
+
         ax.set_xticks(range(len(categories)))
         ax.set_xticklabels(categories, fontsize=11, fontweight='bold')
         ax.set_ylabel(label, fontsize=12)
@@ -267,12 +333,21 @@ def plot_method_categories_with_spo(df_agg, output_dir):
 def plot_comprehensive_comparison(df_agg, output_dir):
     """Comprehensive bar chart comparison."""
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('Comprehensive Model Comparison with SPO Baseline', fontsize=18, y=1.00)
+    fig.suptitle('Comprehensive Model Comparison (Seer=Oracle, SPO=Decision-Focused)', fontsize=18, y=1.00)
 
     methods = df_agg.index.tolist()
 
-    # SPO color coding
-    colors = ['red' if 'SPO' in m else ('steelblue' if m in ['Conformal_CVaR', 'Normal_CVaR', 'QuantileReg_CVaR', 'SAA'] else 'coral') for m in methods]
+    # Seer, SPO, and category color coding
+    colors = []
+    for m in methods:
+        if 'Seer' in m:
+            colors.append('gold')
+        elif 'SPO' in m:
+            colors.append('red')
+        elif m in ['Conformal_CVaR', 'Normal_CVaR', 'QuantileReg_CVaR', 'SAA']:
+            colors.append('steelblue')
+        else:
+            colors.append('coral')
 
     metrics_config = [
         ('Mean_Cost', 'Mean Cost ($)', axes[0, 0]),
@@ -305,7 +380,7 @@ def plot_comprehensive_comparison(df_agg, output_dir):
         ax.set_title(label, fontsize=12, fontweight='bold')
         ax.grid(axis='y', alpha=0.3)
 
-        # Highlight best and SPO
+        # Highlight best, Seer (oracle), and SPO
         if metric != 'Service_Level':
             best_idx = np.argmin(values)
         else:
@@ -314,9 +389,13 @@ def plot_comprehensive_comparison(df_agg, output_dir):
         bars[best_idx].set_edgecolor('green')
         bars[best_idx].set_linewidth(3)
 
-        # Extra highlight for SPO
+        # Extra highlight for Seer and SPO
         for i, method in enumerate(methods):
-            if 'SPO' in method:
+            if 'Seer' in method:
+                bars[i].set_linewidth(4)
+                bars[i].set_edgecolor('darkgoldenrod')
+                bars[i].set_hatch('///')
+            elif 'SPO' in method:
                 bars[i].set_linewidth(3)
                 bars[i].set_edgecolor('darkred')
 
@@ -367,13 +446,16 @@ def create_spo_summary_table(df_agg, output_dir):
     for i in range(1, len(methods) + 1):
         method = methods[i-1]
         for j in range(len(columns)):
-            if 'SPO' in method:
+            if 'Seer' in method:
+                table[(i, j)].set_facecolor('#FFF4CC')  # Light gold for Seer (Oracle)
+                table[(i, j)].set_text_props(weight='bold', style='italic')
+            elif 'SPO' in method:
                 table[(i, j)].set_facecolor('#FFE6E6')  # Light red for SPO
                 table[(i, j)].set_text_props(weight='bold')
             elif i % 2 == 0:
                 table[(i, j)].set_facecolor('#F0F0F0')
 
-    plt.title('Performance Summary: Expanding Window with SPO Baseline\n(Mean ± Std)',
+    plt.title('Performance Summary: Expanding Window with SPO & Seer Baselines\n(Mean ± Std)',
              fontsize=15, fontweight='bold', pad=20)
 
     save_path = Path(output_dir) / "spo_summary_table.png"
@@ -413,17 +495,28 @@ def main():
     print("\n[6/6] Creating summary table...")
     create_spo_summary_table(df_agg, output_dir)
 
-    # Print SPO performance summary
+    # Print performance summary
     print("\n" + "="*70)
-    print("SPO/END-TO-END PERFORMANCE SUMMARY")
+    print("PERFORMANCE SUMMARY")
     print("="*70)
 
+    # Seer (Oracle) performance
+    if 'Seer_Oracle' in df_agg.index:
+        seer_stats = df_agg.loc['Seer_Oracle']
+        print("\n🌟 SEER (PERFECT FORESIGHT ORACLE) - Theoretical Upper Bound:")
+        print(f"  Mean Cost: ${seer_stats[('Mean_Cost', 'mean')]:.2f} ± ${seer_stats[('Mean_Cost', 'std')]:.2f}")
+        print(f"  CVaR-90: ${seer_stats[('CVaR-90', 'mean')]:.2f} ± ${seer_stats[('CVaR-90', 'std')]:.2f}")
+        print(f"  CVaR-95: ${seer_stats[('CVaR-95', 'mean')]:.2f} ± ${seer_stats[('CVaR-95', 'std')]:.2f}")
+        print(f"  MAE: {seer_stats[('MAE', 'mean')]:.2f} (perfect predictions)")
+
+    # SPO performance
     if 'SPO_EndToEnd' in df_agg.index:
         spo_stats = df_agg.loc['SPO_EndToEnd']
-        print(f"\nSPO Mean Cost: ${spo_stats[('Mean_Cost', 'mean')]:.2f} ± ${spo_stats[('Mean_Cost', 'std')]:.2f}")
-        print(f"SPO CVaR-90: ${spo_stats[('CVaR-90', 'mean')]:.2f} ± ${spo_stats[('CVaR-90', 'std')]:.2f}")
-        print(f"SPO CVaR-95: ${spo_stats[('CVaR-95', 'mean')]:.2f} ± ${spo_stats[('CVaR-95', 'std')]:.2f}")
-        print(f"SPO MAE: {spo_stats[('MAE', 'mean')]:.2f} ± {spo_stats[('MAE', 'std')]:.2f}")
+        print("\n🔴 SPO (DECISION-FOCUSED LEARNING):")
+        print(f"  Mean Cost: ${spo_stats[('Mean_Cost', 'mean')]:.2f} ± ${spo_stats[('Mean_Cost', 'std')]:.2f}")
+        print(f"  CVaR-90: ${spo_stats[('CVaR-90', 'mean')]:.2f} ± ${spo_stats[('CVaR-90', 'std')]:.2f}")
+        print(f"  CVaR-95: ${spo_stats[('CVaR-95', 'mean')]:.2f} ± ${spo_stats[('CVaR-95', 'std')]:.2f}")
+        print(f"  MAE: {spo_stats[('MAE', 'mean')]:.2f} ± {spo_stats[('MAE', 'std')]:.2f}")
 
         # Compare to best traditional and DL methods
         traditional_methods = ['Conformal_CVaR', 'Normal_CVaR', 'QuantileReg_CVaR']
@@ -432,15 +525,26 @@ def main():
         trad_in_results = [m for m in traditional_methods if m in df_agg.index]
         dl_in_results = [m for m in dl_methods if m in df_agg.index]
 
+        print("\n📊 COMPARISONS:")
         if trad_in_results:
             best_trad_cvar = df_agg.loc[trad_in_results, ('CVaR-90', 'mean')].min()
-            print(f"\nBest Traditional CVaR-90: ${best_trad_cvar:.2f}")
-            print(f"SPO vs Best Traditional: {((spo_stats[('CVaR-90', 'mean')] / best_trad_cvar - 1) * 100):+.2f}%")
+            print(f"  Best Traditional CVaR-90: ${best_trad_cvar:.2f}")
+            print(f"  SPO vs Best Traditional: {((spo_stats[('CVaR-90', 'mean')] / best_trad_cvar - 1) * 100):+.2f}%")
 
         if dl_in_results:
             best_dl_cvar = df_agg.loc[dl_in_results, ('CVaR-90', 'mean')].min()
-            print(f"Best DL CVaR-90: ${best_dl_cvar:.2f}")
-            print(f"SPO vs Best DL: {((spo_stats[('CVaR-90', 'mean')] / best_dl_cvar - 1) * 100):+.2f}%")
+            print(f"  Best DL CVaR-90: ${best_dl_cvar:.2f}")
+            print(f"  SPO vs Best DL: {((spo_stats[('CVaR-90', 'mean')] / best_dl_cvar - 1) * 100):+.2f}%")
+
+        # Gap to oracle
+        if 'Seer_Oracle' in df_agg.index:
+            seer_cvar = seer_stats[('CVaR-90', 'mean')]
+            print(f"\n  🌟 Seer (Oracle) CVaR-90: ${seer_cvar:.2f}")
+            print(f"  Gap to Oracle (SPO): {((spo_stats[('CVaR-90', 'mean')] / seer_cvar - 1) * 100):+.2f}%")
+            if trad_in_results:
+                print(f"  Gap to Oracle (Best Trad): {((best_trad_cvar / seer_cvar - 1) * 100):+.2f}%")
+            if dl_in_results:
+                print(f"  Gap to Oracle (Best DL): {((best_dl_cvar / seer_cvar - 1) * 100):+.2f}%")
 
     print("\n" + "="*70)
     print("✅ VISUALIZATION COMPLETE!")

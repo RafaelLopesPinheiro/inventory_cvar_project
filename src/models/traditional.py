@@ -438,3 +438,146 @@ class ExpectedValue(BaseForecaster):
         self._check_is_fitted()
         point_pred = self.model.predict(X)
         return PredictionResult(point=point_pred, lower=None, upper=None)
+
+
+class Seer(BaseForecaster):
+    """
+    Seer (Perfect Foresight) Oracle Baseline.
+
+    This model represents the theoretical upper bound of performance by
+    assuming perfect knowledge of future demand. It provides a benchmark
+    to understand:
+    1. Maximum achievable performance (theoretical limit)
+    2. Value of better forecasting (gap between current models and Seer)
+    3. Whether we're approaching the performance ceiling
+
+    The Seer "predicts" by using actual demand values, then computes
+    optimal order quantities. This gives the minimum possible cost
+    achievable with perfect information.
+
+    Note: This is NOT a practical model - it's a theoretical benchmark
+    to measure how much room for improvement exists.
+
+    Usage in experiments:
+    - Shows the "ceiling" performance
+    - Helps interpret if 5% improvement is significant or trivial
+    - Validates that the problem has meaningful uncertainty
+    """
+
+    def __init__(self, alpha: float = 0.05, random_state: int = 42):
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.y_actual = None  # Will store actual demand during prediction
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "Seer":
+        """
+        'Fit' the Seer model (no actual training needed).
+
+        The Seer doesn't learn from historical data - it magically
+        knows future demand. This method exists for API compatibility.
+        """
+        logger.info("'Training' Seer (Perfect Foresight) Oracle...")
+        logger.info("⚠️  Note: Seer has perfect knowledge of future demand")
+        logger.info("⚠️  This is a theoretical upper bound, not a real model")
+        self._is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        'Predict' using actual demand values.
+
+        This method requires the actual demand to be set via
+        predict_with_actuals() before calling this method.
+
+        Returns perfect predictions with zero-width intervals
+        (since there's no uncertainty).
+        """
+        self._check_is_fitted()
+
+        if self.y_actual is None:
+            raise ValueError(
+                "Seer requires actual demand values. "
+                "Use predict_with_actuals(X, y_actual) instead."
+            )
+
+        # Perfect predictions = actual demand
+        point_pred = self.y_actual.copy()
+
+        # Zero-width intervals (perfect certainty)
+        lower = point_pred.copy()
+        upper = point_pred.copy()
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def predict_with_actuals(
+        self,
+        X: np.ndarray,
+        y_actual: np.ndarray
+    ) -> PredictionResult:
+        """
+        'Predict' using actual demand values.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features (not used, only for API compatibility).
+        y_actual : np.ndarray
+            Actual demand values (the "predictions").
+
+        Returns
+        -------
+        PredictionResult
+            Perfect predictions with zero-width intervals.
+        """
+        self._check_is_fitted()
+
+        # Store actual demand
+        self.y_actual = y_actual
+
+        # Perfect predictions = actual demand
+        point_pred = y_actual.copy()
+
+        # Zero-width intervals (perfect certainty)
+        lower = point_pred.copy()
+        upper = point_pred.copy()
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def compute_order_quantities(
+        self,
+        y_actual: np.ndarray,
+        ordering_cost: float = 10.0,
+        holding_cost: float = 2.0,
+        stockout_cost: float = 50.0
+    ) -> np.ndarray:
+        """
+        Compute optimal order quantities with perfect foresight.
+
+        With perfect knowledge of demand, the optimal order quantity
+        is exactly equal to the demand (to minimize holding and stockout
+        costs while meeting all demand).
+
+        Parameters
+        ----------
+        y_actual : np.ndarray
+            Actual demand values.
+        ordering_cost : float
+            Cost per unit ordered (used for computing total cost).
+        holding_cost : float
+            Cost per unit of excess inventory.
+        stockout_cost : float
+            Cost per unit of shortage.
+
+        Returns
+        -------
+        np.ndarray
+            Optimal order quantities (= actual demand).
+        """
+        # With perfect foresight, order exactly the demand
+        # This minimizes holding (0) and stockout (0) costs
+        return y_actual.copy()
