@@ -147,6 +147,24 @@ class TFTConfig:
     batch_size: int = 32
 
 
+@dataclass
+class EnsembleBatchPIConfig:
+    """
+    Ensemble Batch Prediction Intervals + CQR settings.
+
+    Based on:
+    - Xu & Xie (2021) "Conformal prediction interval for dynamic time-series"
+    - Romano et al. (2019) "Conformalized Quantile Regression"
+    """
+    alpha: float = 0.05  # 1 - alpha = coverage level
+    n_ensemble: int = 10  # Number of bootstrap ensemble members
+    n_estimators: int = 100  # Trees per Random Forest
+    max_depth: int = 10  # Maximum tree depth
+    bootstrap_fraction: float = 0.8  # Fraction of data for each bootstrap sample
+    use_quantile_regression: bool = True  # Use CQR for adaptive intervals
+    random_state: int = 42
+
+
 # =============================================================================
 # ROLLING WINDOW CONFIGURATION
 # =============================================================================
@@ -195,6 +213,7 @@ class ExperimentConfig:
     deep_ensemble: DeepEnsembleConfig = field(default_factory=DeepEnsembleConfig)
     mc_dropout: MCDropoutConfig = field(default_factory=MCDropoutConfig)
     tft: TFTConfig = field(default_factory=TFTConfig)
+    ensemble_batch_pi: EnsembleBatchPIConfig = field(default_factory=EnsembleBatchPIConfig)
 
     # Experiment settings
     random_seed: int = 42
