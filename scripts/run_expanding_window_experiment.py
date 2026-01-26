@@ -3,7 +3,18 @@
 Expanding Window Experiment Runner with SPO/End-to-End Baseline
 
 This script runs experiments using expanding window cross-validation,
-comparing all models including the critical SPO/End-to-End competitor.
+comparing all models including the critical SPO/End-to-End competitor
+and the new Ensemble Batch Prediction Intervals + CQR + CVaR method.
+
+Models Compared:
+- Traditional: Conformal, Normal, Quantile Regression, SAA, EnbPI+CQR
+- Deep Learning: LSTM, Transformer, TFT, SPO
+- Oracle: Seer (perfect foresight upper bound)
+
+New EnbPI+CQR+CVaR Method:
+- Xu & Xie (2021): Bootstrap ensemble with LOO residuals
+- Romano et al. (2019): Conformalized Quantile Regression for adaptive intervals
+- CVaR optimization for risk-averse order quantities
 
 Key differences from rolling window:
 - Training set expands over time (not sliding)
@@ -38,6 +49,7 @@ from src.models import (
     SampleAverageApproximation,
     ExpectedValue,
     Seer,
+    EnsembleBatchPI,
     LSTMQuantileRegression,
     TransformerQuantileRegression,
     DeepEnsemble,
@@ -180,6 +192,39 @@ def run_window_experiment(
     results["QuantileReg_CVaR"] = compute_all_metrics(
         "QuantileReg_CVaR", y_test, qr_pred.point, qr_orders,
         qr_pred.lower, qr_pred.upper,
+        costs.ordering_cost, costs.holding_cost, costs.stockout_cost
+    )
+
+    # =========================================================================
+    # ENSEMBLE BATCH PI + CQR (EnbPI+CQR)
+    # =========================================================================
+    # This method combines:
+    # 1. Bootstrap ensemble for robust predictions (Xu & Xie, 2021)
+    # 2. Conformalized Quantile Regression for adaptive intervals (Romano et al., 2019)
+    # 3. CVaR optimization for risk-averse order quantities
+
+    logger.info("Running Ensemble Batch PI + CQR...")
+    enbpi_model = EnsembleBatchPI(
+        alpha=config.ensemble_batch_pi.alpha,
+        n_ensemble=config.ensemble_batch_pi.n_ensemble,
+        n_estimators=config.ensemble_batch_pi.n_estimators,
+        max_depth=config.ensemble_batch_pi.max_depth,
+        bootstrap_fraction=config.ensemble_batch_pi.bootstrap_fraction,
+        use_quantile_regression=config.ensemble_batch_pi.use_quantile_regression,
+        random_state=config.random_seed
+    )
+    enbpi_model.fit(X_train, y_train, X_cal, y_cal)
+    enbpi_pred = enbpi_model.predict(X_test)
+    enbpi_orders = compute_order_quantities_cvar(
+        enbpi_pred.point, enbpi_pred.lower, enbpi_pred.upper,
+        beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+        ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+        stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+        verbose=False
+    )
+    results["EnbPI_CQR_CVaR"] = compute_all_metrics(
+        "EnbPI_CQR_CVaR", y_test, enbpi_pred.point, enbpi_orders,
+        enbpi_pred.lower, enbpi_pred.upper,
         costs.ordering_cost, costs.holding_cost, costs.stockout_cost
     )
 
@@ -363,7 +408,7 @@ def run_window_experiment(
     # =========================================================================
 
     # Align traditional methods to sequence-aligned test data
-    for name in ["Conformal_CVaR", "Normal_CVaR", "QuantileReg_CVaR", "SAA", "Seer_Oracle"]:
+    for name in ["Conformal_CVaR", "Normal_CVaR", "QuantileReg_CVaR", "EnbPI_CQR_CVaR", "SAA", "Seer_Oracle"]:
         result = results[name]
         results[name] = MethodResults(
             method_name=name,
