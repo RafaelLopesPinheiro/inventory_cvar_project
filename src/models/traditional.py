@@ -2,14 +2,27 @@
 Traditional (non-deep learning) forecasting models.
 
 Models implemented:
-- ConformalPrediction: Distribution-free prediction intervals with coverage guarantees
+- HistoricalQuantile: Naïve empirical quantile baseline
 - NormalAssumption: Parametric Gaussian assumption
-- QuantileRegression: Direct quantile estimation with conformal calibration
+- BootstrappedNewsvendor: Bootstrap resampling for uncertainty quantification
 - SampleAverageApproximation: Standard OR benchmark
+- TwoStageStochastic: Scenario-based stochastic optimization
+- ConformalPrediction: Distribution-free prediction intervals with coverage guarantees
+- QuantileRegression: Direct quantile estimation with conformal calibration
+- EnsembleBatchPI: EnbPI + CQR for adaptive prediction intervals
+- Seer: Oracle with perfect foresight (upper bound)
+
+References:
+- Vovk et al. (2005) "Algorithmic Learning in a Random World"
+- Romano et al. (2019) "Conformalized Quantile Regression"
+- Xu & Xie (2021) "Conformal prediction interval for dynamic time-series"
+- Birge & Louveaux (2011) "Introduction to Stochastic Programming"
+- Efron & Tibshirani (1993) "An Introduction to the Bootstrap"
 """
 
 import numpy as np
 from scipy import stats
+from scipy.optimize import minimize, linprog
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from typing import Optional, List, Tuple, Set
 import logging
@@ -17,6 +30,633 @@ import logging
 from .base import BaseForecaster, PredictionResult
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# HISTORICAL QUANTILE (NAÏVE BASELINE)
+# =============================================================================
+
+class HistoricalQuantile(BaseForecaster):
+    """
+    Historical Quantile (Naïve) Baseline.
+
+    This is the simplest possible uncertainty quantification method that uses
+    empirical quantiles directly from historical data without any modeling.
+
+    The method:
+    1. Computes point prediction as the historical mean (or median)
+    2. Uses empirical quantiles of historical demand for prediction intervals
+    3. Does NOT use features - purely data-driven baseline
+
+    This represents the "do nothing sophisticated" approach and serves as a
+    lower bound for what any reasonable method should beat.
+
+    Mathematical formulation:
+    - Point prediction: μ̂ = mean(D_train)
+    - Lower bound: q̂_α/2 = Quantile(D_train ∪ D_cal, α/2)
+    - Upper bound: q̂_(1-α/2) = Quantile(D_train ∪ D_cal, 1-α/2)
+
+    References
+    ----------
+    - Hyndman & Athanasopoulos (2021) "Forecasting: Principles and Practice"
+    - Makridakis et al. (2020) "The M5 Accuracy Competition"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        use_median: bool = False,
+        random_state: int = 42
+    ):
+        """
+        Initialize the Historical Quantile model.
+
+        Parameters
+        ----------
+        alpha : float
+            Significance level for prediction intervals (1-alpha coverage).
+        use_median : bool
+            If True, use median as point prediction; otherwise use mean.
+        random_state : int
+            Random seed for reproducibility (not used, for API consistency).
+        """
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.use_median = use_median
+
+        # Computed quantities
+        self.point_estimate: Optional[float] = None
+        self.lower_quantile: Optional[float] = None
+        self.upper_quantile: Optional[float] = None
+        self.historical_demand: Optional[np.ndarray] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "HistoricalQuantile":
+        """
+        Compute historical statistics from training and calibration data.
+
+        Note: X_train and X_cal are NOT used - this is a purely data-driven
+        baseline that only uses historical demand values.
+        """
+        logger.info("Training Historical Quantile (Naïve) baseline...")
+
+        # Combine all historical demand
+        self.historical_demand = np.concatenate([y_train, y_cal])
+
+        # Compute point estimate
+        if self.use_median:
+            self.point_estimate = np.median(self.historical_demand)
+            logger.info(f"Point estimate (median): {self.point_estimate:.2f}")
+        else:
+            self.point_estimate = np.mean(self.historical_demand)
+            logger.info(f"Point estimate (mean): {self.point_estimate:.2f}")
+
+        # Compute empirical quantiles for prediction intervals
+        self.lower_quantile = np.quantile(self.historical_demand, self.alpha / 2)
+        self.upper_quantile = np.quantile(self.historical_demand, 1 - self.alpha / 2)
+
+        logger.info(f"Prediction interval: [{self.lower_quantile:.2f}, {self.upper_quantile:.2f}]")
+        logger.info(f"Historical demand stats: min={self.historical_demand.min():.2f}, "
+                   f"max={self.historical_demand.max():.2f}, std={self.historical_demand.std():.2f}")
+
+        self._is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions using historical statistics.
+
+        Note: X is NOT used - all predictions are the same constant values.
+        """
+        self._check_is_fitted()
+
+        n_samples = len(X)
+
+        # Constant predictions (same for all time points)
+        point_pred = np.full(n_samples, self.point_estimate)
+        lower = np.full(n_samples, self.lower_quantile)
+        upper = np.full(n_samples, self.upper_quantile)
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def get_params(self) -> dict:
+        """Get model parameters."""
+        params = super().get_params()
+        params.update({
+            "use_median": self.use_median,
+            "point_estimate": self.point_estimate,
+            "lower_quantile": self.lower_quantile,
+            "upper_quantile": self.upper_quantile
+        })
+        return params
+
+
+# =============================================================================
+# BOOTSTRAPPED NEWSVENDOR (RESAMPLING-BASED)
+# =============================================================================
+
+class BootstrappedNewsvendor(BaseForecaster):
+    """
+    Bootstrapped Newsvendor with Resampling-Based Uncertainty Quantification.
+
+    This method uses bootstrap resampling to estimate the uncertainty in
+    demand forecasts and compute prediction intervals without parametric
+    assumptions.
+
+    The method:
+    1. Train a point predictor (Random Forest) on training data
+    2. Bootstrap resample residuals from calibration data
+    3. Generate multiple demand scenarios by adding resampled residuals
+    4. Compute prediction intervals from the bootstrap distribution
+    5. Order quantity is the (1-α) quantile of scenarios (newsvendor solution)
+
+    Key advantages:
+    - Non-parametric: No distributional assumptions
+    - Captures heteroscedasticity through residual resampling
+    - Directly interpretable uncertainty estimates
+
+    Mathematical formulation:
+    For each prediction x_i:
+    1. Point prediction: ŷ_i = f(x_i)
+    2. Residuals: ε_j = y_j - f(x_j), j ∈ calibration set
+    3. Bootstrap scenarios: D_i^(b) = ŷ_i + ε*_b, where ε*_b ~ Bootstrap(ε)
+    4. Prediction interval: [Q_{α/2}(D_i), Q_{1-α/2}(D_i)]
+
+    References
+    ----------
+    - Efron & Tibshirani (1993) "An Introduction to the Bootstrap"
+    - Levi et al. (2015) "The Data-Driven Newsvendor Problem"
+    - Ban & Rudin (2019) "The Big Data Newsvendor"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        n_bootstrap: int = 1000,
+        n_estimators: int = 100,
+        max_depth: int = 10,
+        block_bootstrap: bool = False,
+        block_size: int = 7,
+        random_state: int = 42
+    ):
+        """
+        Initialize the Bootstrapped Newsvendor model.
+
+        Parameters
+        ----------
+        alpha : float
+            Significance level for prediction intervals (1-alpha coverage).
+        n_bootstrap : int
+            Number of bootstrap samples to generate.
+        n_estimators : int
+            Number of trees in the Random Forest.
+        max_depth : int
+            Maximum depth of trees.
+        block_bootstrap : bool
+            If True, use block bootstrap to preserve temporal structure.
+        block_size : int
+            Size of blocks for block bootstrap.
+        random_state : int
+            Random seed for reproducibility.
+        """
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.n_bootstrap = n_bootstrap
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.block_bootstrap = block_bootstrap
+        self.block_size = block_size
+
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+
+        # Stored quantities
+        self.residuals: Optional[np.ndarray] = None
+        self.bootstrap_indices: Optional[np.ndarray] = None
+
+    def _generate_block_bootstrap_indices(
+        self,
+        n_samples: int,
+        n_residuals: int,
+        rng: np.random.RandomState
+    ) -> np.ndarray:
+        """
+        Generate block bootstrap indices to preserve temporal dependence.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of bootstrap samples to generate.
+        n_residuals : int
+            Number of residuals available.
+        rng : np.random.RandomState
+            Random number generator.
+
+        Returns
+        -------
+        np.ndarray
+            Bootstrap indices of shape (n_samples,).
+        """
+        indices = []
+        n_blocks = (n_samples + self.block_size - 1) // self.block_size
+
+        for _ in range(n_blocks):
+            # Randomly select block starting position
+            start_idx = rng.randint(0, n_residuals - self.block_size + 1)
+            block_indices = np.arange(start_idx, start_idx + self.block_size)
+            indices.extend(block_indices)
+
+        return np.array(indices[:n_samples])
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "BootstrappedNewsvendor":
+        """
+        Train model and compute residuals for bootstrap resampling.
+        """
+        logger.info("Training Bootstrapped Newsvendor...")
+        logger.info(f"Bootstrap samples: {self.n_bootstrap}, "
+                   f"Block bootstrap: {self.block_bootstrap}")
+
+        # Train point predictor
+        self.model.fit(X_train, y_train)
+
+        # Compute residuals on calibration data
+        cal_predictions = self.model.predict(X_cal)
+        self.residuals = y_cal - cal_predictions
+
+        logger.info(f"Residual statistics: mean={np.mean(self.residuals):.2f}, "
+                   f"std={np.std(self.residuals):.2f}")
+
+        # Pre-generate bootstrap indices for efficiency
+        rng = np.random.RandomState(self.random_state)
+        if self.block_bootstrap and len(self.residuals) >= self.block_size:
+            self.bootstrap_indices = self._generate_block_bootstrap_indices(
+                self.n_bootstrap, len(self.residuals), rng
+            )
+        else:
+            self.bootstrap_indices = rng.choice(
+                len(self.residuals),
+                size=self.n_bootstrap,
+                replace=True
+            )
+
+        self._is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions with bootstrap-based prediction intervals.
+        """
+        self._check_is_fitted()
+
+        # Point predictions
+        point_pred = self.model.predict(X)
+
+        # Generate bootstrap scenarios for each prediction
+        n_samples = len(X)
+        lower = np.zeros(n_samples)
+        upper = np.zeros(n_samples)
+
+        # Resample residuals
+        bootstrap_residuals = self.residuals[self.bootstrap_indices]
+
+        for i in range(n_samples):
+            # Generate demand scenarios
+            scenarios = point_pred[i] + bootstrap_residuals
+
+            # Compute prediction interval quantiles
+            lower[i] = np.quantile(scenarios, self.alpha / 2)
+            upper[i] = np.quantile(scenarios, 1 - self.alpha / 2)
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def compute_order_quantities(
+        self,
+        X: np.ndarray,
+        critical_ratio: float
+    ) -> np.ndarray:
+        """
+        Compute newsvendor-optimal order quantities.
+
+        Uses the bootstrap distribution to find the critical quantile.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features for prediction.
+        critical_ratio : float
+            Newsvendor critical ratio: cu / (cu + co).
+
+        Returns
+        -------
+        np.ndarray
+            Optimal order quantities.
+        """
+        self._check_is_fitted()
+
+        point_pred = self.model.predict(X)
+        bootstrap_residuals = self.residuals[self.bootstrap_indices]
+
+        order_quantities = []
+        for i in range(len(X)):
+            scenarios = point_pred[i] + bootstrap_residuals
+            q_optimal = np.quantile(scenarios, critical_ratio)
+            order_quantities.append(max(0, q_optimal))
+
+        return np.array(order_quantities)
+
+    def get_params(self) -> dict:
+        """Get model parameters."""
+        params = super().get_params()
+        params.update({
+            "n_bootstrap": self.n_bootstrap,
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "block_bootstrap": self.block_bootstrap,
+            "block_size": self.block_size
+        })
+        return params
+
+
+# =============================================================================
+# TWO-STAGE STOCHASTIC PROGRAMMING
+# =============================================================================
+
+class TwoStageStochastic(BaseForecaster):
+    """
+    Two-Stage Stochastic Programming for Inventory Optimization.
+
+    This method formulates the newsvendor problem as a two-stage stochastic
+    program and solves it using scenario-based optimization.
+
+    Stage 1 (Here-and-now): Decide order quantity q before demand is known
+    Stage 2 (Wait-and-see): Realize demand D, incur holding/stockout costs
+
+    Mathematical formulation:
+    min_q  c_o * q + E[Q(q, D)]
+
+    where Q(q, D) is the recourse function:
+    Q(q, D) = min_{y^+, y^-}  c_h * y^+ + c_u * y^-
+              s.t.  y^+ - y^- = q - D
+                    y^+, y^- >= 0
+
+    This simplifies to:
+    Q(q, D) = c_h * max(0, q - D) + c_u * max(0, D - q)
+
+    Using SAA (Sample Average Approximation):
+    min_q  c_o * q + (1/N) * Σ_i [c_h * max(0, q - d_i) + c_u * max(0, d_i - q)]
+
+    Key differences from simple SAA:
+    - Explicit two-stage formulation
+    - Can incorporate additional constraints
+    - Extensible to multi-stage problems
+    - Provides bounds on optimal value
+
+    References
+    ----------
+    - Birge & Louveaux (2011) "Introduction to Stochastic Programming"
+    - Shapiro, Dentcheva, Ruszczynski (2009) "Lectures on Stochastic Programming"
+    - Kleywegt et al. (2002) "The Sample Average Approximation Method"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        n_scenarios: int = 500,
+        n_estimators: int = 100,
+        max_depth: int = 10,
+        ordering_cost: float = 10.0,
+        holding_cost: float = 2.0,
+        stockout_cost: float = 50.0,
+        use_cvar: bool = False,
+        cvar_beta: float = 0.90,
+        random_state: int = 42
+    ):
+        """
+        Initialize the Two-Stage Stochastic model.
+
+        Parameters
+        ----------
+        alpha : float
+            Significance level for prediction intervals.
+        n_scenarios : int
+            Number of demand scenarios for SAA.
+        n_estimators : int
+            Number of trees in the Random Forest.
+        max_depth : int
+            Maximum depth of trees.
+        ordering_cost : float
+            Cost per unit ordered.
+        holding_cost : float
+            Cost per unit of overage.
+        stockout_cost : float
+            Cost per unit of underage.
+        use_cvar : bool
+            If True, optimize CVaR instead of expected cost.
+        cvar_beta : float
+            CVaR level (only used if use_cvar=True).
+        random_state : int
+            Random seed for reproducibility.
+        """
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.n_scenarios = n_scenarios
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.ordering_cost = ordering_cost
+        self.holding_cost = holding_cost
+        self.stockout_cost = stockout_cost
+        self.use_cvar = use_cvar
+        self.cvar_beta = cvar_beta
+
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+
+        # Stored quantities
+        self.residuals: Optional[np.ndarray] = None
+        self.sigma: Optional[float] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "TwoStageStochastic":
+        """
+        Train model and compute residual distribution for scenario generation.
+        """
+        logger.info("Training Two-Stage Stochastic Programming model...")
+        logger.info(f"Scenarios: {self.n_scenarios}, CVaR: {self.use_cvar}")
+
+        # Train point predictor
+        self.model.fit(X_train, y_train)
+
+        # Compute residuals for scenario generation
+        cal_predictions = self.model.predict(X_cal)
+        self.residuals = y_cal - cal_predictions
+        self.sigma = np.std(self.residuals)
+
+        logger.info(f"Residual std: {self.sigma:.2f}")
+
+        self._is_fitted = True
+        return self
+
+    def _solve_two_stage(
+        self,
+        point_pred: float,
+        scenarios: np.ndarray
+    ) -> Tuple[float, float, float]:
+        """
+        Solve the two-stage stochastic program for a single time period.
+
+        Parameters
+        ----------
+        point_pred : float
+            Point prediction (not directly used, but available).
+        scenarios : np.ndarray
+            Demand scenarios.
+
+        Returns
+        -------
+        Tuple[float, float, float]
+            Optimal order quantity, lower bound, upper bound.
+        """
+        n = len(scenarios)
+
+        def objective(q):
+            """Expected cost objective."""
+            overage = np.maximum(0, q - scenarios)
+            underage = np.maximum(0, scenarios - q)
+            stage1_cost = self.ordering_cost * q
+            stage2_cost = np.mean(
+                self.holding_cost * overage + self.stockout_cost * underage
+            )
+            return stage1_cost + stage2_cost
+
+        def cvar_objective(params):
+            """CVaR objective using Rockafellar-Uryasev formulation."""
+            q, tau = params
+            overage = np.maximum(0, q - scenarios)
+            underage = np.maximum(0, scenarios - q)
+            costs = (
+                self.ordering_cost * q +
+                self.holding_cost * overage +
+                self.stockout_cost * underage
+            )
+            cvar_term = tau + (1 / (n * (1 - self.cvar_beta))) * np.sum(
+                np.maximum(0, costs - tau)
+            )
+            return cvar_term
+
+        if self.use_cvar:
+            # CVaR optimization
+            q0 = np.mean(scenarios)
+            tau0 = np.median(scenarios) * self.ordering_cost
+            result = minimize(
+                cvar_objective,
+                [q0, tau0],
+                method='L-BFGS-B',
+                bounds=[(0, None), (None, None)]
+            )
+            q_optimal = max(0, result.x[0])
+        else:
+            # Expected cost optimization
+            # Analytical solution: critical quantile
+            critical_ratio = self.stockout_cost / (self.stockout_cost + self.holding_cost)
+            q_optimal = np.quantile(scenarios, critical_ratio)
+            q_optimal = max(0, q_optimal)
+
+        # Prediction intervals from scenarios
+        lower = np.quantile(scenarios, self.alpha / 2)
+        upper = np.quantile(scenarios, 1 - self.alpha / 2)
+
+        return q_optimal, lower, upper
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions with scenario-based prediction intervals.
+        """
+        self._check_is_fitted()
+
+        rng = np.random.RandomState(self.random_state)
+        point_pred = self.model.predict(X)
+
+        n_samples = len(X)
+        lower = np.zeros(n_samples)
+        upper = np.zeros(n_samples)
+
+        for i in range(n_samples):
+            # Generate demand scenarios
+            residual_samples = rng.choice(self.residuals, size=self.n_scenarios, replace=True)
+            scenarios = point_pred[i] + residual_samples
+
+            # Solve two-stage problem (just for bounds here)
+            _, lower[i], upper[i] = self._solve_two_stage(point_pred[i], scenarios)
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def compute_order_quantities(self, X: np.ndarray) -> np.ndarray:
+        """
+        Compute optimal order quantities using two-stage stochastic optimization.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features for prediction.
+
+        Returns
+        -------
+        np.ndarray
+            Optimal order quantities.
+        """
+        self._check_is_fitted()
+
+        rng = np.random.RandomState(self.random_state)
+        point_pred = self.model.predict(X)
+
+        order_quantities = []
+        for i in range(len(X)):
+            # Generate demand scenarios
+            residual_samples = rng.choice(self.residuals, size=self.n_scenarios, replace=True)
+            scenarios = point_pred[i] + residual_samples
+
+            # Solve two-stage problem
+            q_optimal, _, _ = self._solve_two_stage(point_pred[i], scenarios)
+            order_quantities.append(q_optimal)
+
+        return np.array(order_quantities)
+
+    def get_params(self) -> dict:
+        """Get model parameters."""
+        params = super().get_params()
+        params.update({
+            "n_scenarios": self.n_scenarios,
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "ordering_cost": self.ordering_cost,
+            "holding_cost": self.holding_cost,
+            "stockout_cost": self.stockout_cost,
+            "use_cvar": self.use_cvar,
+            "cvar_beta": self.cvar_beta,
+            "sigma": self.sigma
+        })
+        return params
 
 
 class ConformalPrediction(BaseForecaster):

@@ -321,14 +321,167 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
     def predict(self, X: np.ndarray) -> PredictionResult:
         """Generate calibrated predictions."""
         self._check_is_fitted()
-        
+
         raw = self._predict_raw(X)
-        
+
         return PredictionResult(
             point=raw.point,
             lower=raw.lower - self.calibration_adjustment,
             upper=raw.upper + self.calibration_adjustment
         )
+
+
+# =============================================================================
+# LSTM QUANTILE LOSS ONLY (WITHOUT CONFORMAL CALIBRATION)
+# =============================================================================
+
+class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
+    """
+    LSTM Quantile Regression WITHOUT Conformal Calibration.
+
+    This model uses pinball loss to directly predict quantiles but does NOT
+    apply conformal calibration post-hoc. This serves as an important baseline
+    to measure the value of conformal calibration.
+
+    Key differences from LSTMQuantileRegression:
+    - No conformal calibration step
+    - Prediction intervals come directly from quantile network outputs
+    - May have coverage below nominal level (uncalibrated)
+
+    This represents "LSTM Quantile Loss (DL without calibration)" in the
+    model hierarchy.
+
+    References
+    ----------
+    - Wen et al. (2017) "A Multi-Horizon Quantile Recurrent Forecaster"
+    - Gasthaus et al. (2019) "Probabilistic Forecasting with Spline Quantile"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        sequence_length: int = 28,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        learning_rate: float = 0.001,
+        epochs: int = 100,
+        batch_size: int = 32,
+        random_state: int = 42,
+        device: str = "cpu"
+    ):
+        super().__init__(
+            alpha=alpha,
+            sequence_length=sequence_length,
+            random_state=random_state,
+            device=device
+        )
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.epochs = epochs
+        self.batch_size = batch_size
+
+        self.quantiles = [alpha / 2, 0.5, 1 - alpha / 2]
+        self.model: Optional[LSTMQuantileNet] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "LSTMQuantileLossOnly":
+        """
+        Train LSTM WITHOUT conformal calibration.
+
+        Note: X_cal and y_cal are included for API consistency but NOT used
+        for calibration in this model.
+        """
+        logger.info("Training LSTM Quantile Loss Only (NO calibration)...")
+        logger.info(f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}")
+        logger.info("⚠️  No conformal calibration will be applied")
+
+        # Set random seed
+        torch.manual_seed(self.random_state)
+
+        # Normalize features
+        X_train_norm = self._normalize(X_train, fit=True)
+
+        # Convert to tensors
+        X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
+        y_tensor = torch.FloatTensor(y_train).to(self.device)
+
+        # Create data loader
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        # Initialize model
+        input_size = X_train.shape[2]
+        self.model = LSTMQuantileNet(
+            input_size=input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+            quantiles=self.quantiles
+        ).to(self.device)
+
+        # Loss and optimizer
+        criterion = QuantileLoss(self.quantiles)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+        # Training loop
+        self.model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(dataloader)
+            self.training_losses.append(avg_loss)
+            scheduler.step(avg_loss)
+
+            if (epoch + 1) % 20 == 0:
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
+
+        # NO CALIBRATION - this is the key difference
+        self.calibration_adjustment = 0.0
+        logger.info("⚠️  Skipping conformal calibration (uncalibrated intervals)")
+
+        self._is_fitted = True
+        return self
+
+    def _predict_raw(self, X: np.ndarray) -> PredictionResult:
+        """Generate raw (uncalibrated) predictions."""
+        self.model.eval()
+        X_norm = self._normalize(X)
+        X_tensor = torch.FloatTensor(X_norm).to(self.device)
+
+        with torch.no_grad():
+            predictions = self.model(X_tensor).cpu().numpy()
+
+        return PredictionResult(
+            point=predictions[:, 1],  # Median
+            lower=predictions[:, 0],
+            upper=predictions[:, 2]
+        )
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions WITHOUT calibration adjustment.
+
+        Returns raw quantile predictions directly from the network.
+        """
+        self._check_is_fitted()
+        return self._predict_raw(X)
 
 
 # =============================================================================

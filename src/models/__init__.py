@@ -3,17 +3,28 @@
 from .base import BaseForecaster, BaseDeepLearningForecaster, PredictionResult
 
 from .traditional import (
-    ConformalPrediction,
+    # Naïve baselines
+    HistoricalQuantile,
+    # Parametric models
     NormalAssumption,
-    QuantileRegression,
+    # Resampling-based methods
+    BootstrappedNewsvendor,
+    # OR methods
     SampleAverageApproximation,
+    TwoStageStochastic,
+    # Conformal prediction methods
+    ConformalPrediction,
+    QuantileRegression,
+    # Ensemble methods
+    EnsembleBatchPI,
+    # Utilities
     ExpectedValue,
     Seer,
-    EnsembleBatchPI,
 )
 
 from .deep_learning import (
     LSTMQuantileRegression,
+    LSTMQuantileLossOnly,
     TransformerQuantileRegression,
     DeepEnsemble,
     MCDropoutLSTM,
@@ -27,18 +38,22 @@ __all__ = [
     "BaseForecaster",
     "BaseDeepLearningForecaster",
     "PredictionResult",
-    
-    # Traditional models
-    "ConformalPrediction",
-    "NormalAssumption",
-    "QuantileRegression",
-    "SampleAverageApproximation",
+
+    # Traditional models (Simple → Advanced)
+    "HistoricalQuantile",       # Naïve baseline
+    "NormalAssumption",         # Parametric
+    "BootstrappedNewsvendor",   # Resampling
+    "SampleAverageApproximation",  # Standard OR
+    "TwoStageStochastic",       # Scenario optimization
+    "ConformalPrediction",      # Distribution-free
+    "QuantileRegression",       # Direct quantile
+    "EnsembleBatchPI",          # EnbPI+CQR
     "ExpectedValue",
     "Seer",
-    "EnsembleBatchPI",
-    
+
     # Deep learning models
-    "LSTMQuantileRegression",
+    "LSTMQuantileRegression",     # LSTM with conformal calibration
+    "LSTMQuantileLossOnly",       # LSTM without calibration
     "TransformerQuantileRegression",
     "DeepEnsemble",
     "MCDropoutLSTM",
