@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 """
-Comprehensive Expanding Window Experiment: Simple → Advanced → Your Method
+Comprehensive Multi-SKU Expanding Window Experiment: Simple -> Advanced -> Your Method
 
 This script implements a rigorous comparison of 12 forecasting methods for
-inventory optimization using expanding window cross-validation.
+inventory optimization using expanding window cross-validation across
+MULTIPLE store-item (SKU) combinations.
 
-Model Hierarchy (Simple → Advanced → Your Method):
+Model Hierarchy (Simple -> Advanced -> Your Method):
 ==================================================
-1. Historical Quantile      - Naïve empirical quantile baseline
+1. Historical Quantile      - Naive empirical quantile baseline
 2. Normal Assumption        - Parametric Gaussian assumption
 3. Bootstrapped Newsvendor  - Resampling-based uncertainty quantification
 4. SAA                      - Standard Operations Research benchmark
@@ -22,6 +23,7 @@ Model Hierarchy (Simple → Advanced → Your Method):
 
 Key Experimental Design:
 ========================
+- Multi-SKU: Runs across multiple store-item combinations
 - Expanding Window: Training set grows over time (not sliding)
 - Calibration Set: Fixed size for conformal calibration
 - Test Window: Monthly prediction horizon
@@ -37,7 +39,17 @@ References:
 - Efron & Tibshirani (1993) "An Introduction to the Bootstrap"
 
 Usage:
-    python run_comprehensive_expanding_window.py [--epochs EPOCHS] [--output OUTPUT_DIR]
+    # Single SKU (backward compatible)
+    python run_comprehensive_expanding_window.py
+
+    # Multiple SKUs
+    python run_comprehensive_expanding_window.py --stores 1,2,3 --items 1,2,3,4,5
+
+    # All stores and items (be careful - this can take a long time!)
+    python run_comprehensive_expanding_window.py --stores 1-10 --items 1-50
+
+    # Skip deep learning models for faster execution
+    python run_comprehensive_expanding_window.py --stores 1,2,3 --items 1,2,3 --no-dl
 """
 
 import argparse
@@ -46,23 +58,27 @@ import os
 import sys
 import warnings
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data import (
-    load_and_prepare_rolling_data,
+    load_raw_data,
+    filter_store_item,
+    create_all_features,
+    create_rolling_window_splits,
     prepare_rolling_sequence_data,
     RollingWindowSplit,
 )
 from src.models import (
-    # Traditional models (Simple → Advanced)
+    # Traditional models (Simple -> Advanced)
     HistoricalQuantile,
     NormalAssumption,
     BootstrappedNewsvendor,
@@ -133,10 +149,116 @@ def get_model_display_name(method_name: str) -> str:
         "LSTMQuantileLoss": "8. LSTM (Uncalibrated)",
         "LSTMConformal": "9. LSTM+Conformal",
         "SPO": "10. SPO",
-        "EnbPI_CQR_CVaR": "11. EnbPI+CQR+CVaR ★",
+        "EnbPI_CQR_CVaR": "11. EnbPI+CQR+CVaR",
         "Seer": "12. Seer (Oracle)",
     }
     return display_names.get(method_name, method_name)
+
+
+# =============================================================================
+# MULTI-SKU DATA LOADING
+# =============================================================================
+
+def load_expanding_window_data_multi_sku(
+    filepath: str,
+    store_ids: List[int],
+    item_ids: List[int],
+    lag_periods: List[int] = [1, 7, 28],
+    rolling_windows: List[int] = [7, 28],
+    initial_train_days: int = 730,
+    calibration_days: int = 365,
+    test_window_days: int = 30,
+    step_days: int = 30,
+    min_records: int = 365 * 3
+) -> Dict[Tuple[int, int], List[RollingWindowSplit]]:
+    """
+    Load expanding window data for multiple store-item combinations.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the CSV file.
+    store_ids : List[int]
+        List of store IDs.
+    item_ids : List[int]
+        List of item IDs.
+    lag_periods : List[int]
+        Lag periods for features.
+    rolling_windows : List[int]
+        Rolling window sizes.
+    initial_train_days : int
+        Initial training period in days.
+    calibration_days : int
+        Calibration period in days.
+    test_window_days : int
+        Test window size in days.
+    step_days : int
+        Step size for rolling windows.
+    min_records : int
+        Minimum records required for a store-item combo.
+
+    Returns
+    -------
+    Dict[Tuple[int, int], List[RollingWindowSplit]]
+        Dictionary mapping (store_id, item_id) to list of rolling window splits.
+    """
+    logger.info(f"Loading expanding window data for {len(store_ids)} stores x {len(item_ids)} items")
+
+    # Load raw data once
+    df_raw = load_raw_data(filepath)
+
+    results = {}
+    skipped = []
+
+    total = len(store_ids) * len(item_ids)
+    with tqdm(total=total, desc="Loading SKU data") as pbar:
+        for store_id in store_ids:
+            for item_id in item_ids:
+                try:
+                    # Filter for this store-item
+                    df = filter_store_item(df_raw, store_id, item_id)
+
+                    if len(df) < min_records:
+                        skipped.append((store_id, item_id, f"insufficient data ({len(df)} < {min_records})"))
+                        pbar.update(1)
+                        continue
+
+                    # Create features
+                    df, feature_cols = create_all_features(
+                        df,
+                        lag_periods=lag_periods,
+                        rolling_windows=rolling_windows
+                    )
+
+                    # Create expanding window splits
+                    splits = create_rolling_window_splits(
+                        df,
+                        feature_cols,
+                        initial_train_days=initial_train_days,
+                        calibration_days=calibration_days,
+                        test_window_days=test_window_days,
+                        step_days=step_days
+                    )
+
+                    if len(splits) > 0:
+                        results[(store_id, item_id)] = splits
+                    else:
+                        skipped.append((store_id, item_id, "no valid windows"))
+
+                except Exception as e:
+                    skipped.append((store_id, item_id, str(e)))
+
+                pbar.update(1)
+
+    logger.info(f"Successfully loaded {len(results)} store-item combinations")
+    if skipped:
+        logger.warning(f"Skipped {len(skipped)} combinations:")
+        for store_id, item_id, reason in skipped[:5]:
+            logger.warning(f"  Store {store_id}, Item {item_id}: {reason}")
+        if len(skipped) > 5:
+            logger.warning(f"  ... and {len(skipped) - 5} more")
+
+    return results
 
 
 # =============================================================================
@@ -165,10 +287,6 @@ def run_single_window(
     pd.DataFrame
         Results summary for this window.
     """
-    logger.info(f"\n{'='*80}")
-    logger.info(f"WINDOW {window_split.window_idx}: {window_split.test_start_date.date()} to {window_split.test_end_date.date()}")
-    logger.info(f"{'='*80}")
-
     results = {}
     costs = config.cost
 
@@ -192,9 +310,8 @@ def run_single_window(
         n_test_seq = len(y_test)
 
     # =========================================================================
-    # 1. HISTORICAL QUANTILE (NAÏVE BASELINE)
+    # 1. HISTORICAL QUANTILE (NAIVE BASELINE)
     # =========================================================================
-    logger.info("\n[1/12] Running Historical Quantile (Naïve)...")
     try:
         hq_model = HistoricalQuantile(alpha=config.conformal.alpha, random_state=config.random_seed)
         hq_model.fit(X_train, y_train, X_cal, y_cal)
@@ -212,12 +329,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Historical Quantile failed: {e}")
+        logger.debug(f"Historical Quantile failed: {e}")
 
     # =========================================================================
     # 2. NORMAL ASSUMPTION (PARAMETRIC)
     # =========================================================================
-    logger.info("\n[2/12] Running Normal Assumption (Parametric)...")
     try:
         normal_model = NormalAssumption(
             alpha=config.normal.alpha,
@@ -240,12 +356,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Normal Assumption failed: {e}")
+        logger.debug(f"Normal Assumption failed: {e}")
 
     # =========================================================================
     # 3. BOOTSTRAPPED NEWSVENDOR (RESAMPLING)
     # =========================================================================
-    logger.info("\n[3/12] Running Bootstrapped Newsvendor (Resampling)...")
     try:
         boot_model = BootstrappedNewsvendor(
             alpha=config.conformal.alpha,
@@ -269,12 +384,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Bootstrapped Newsvendor failed: {e}")
+        logger.debug(f"Bootstrapped Newsvendor failed: {e}")
 
     # =========================================================================
     # 4. SAA (STANDARD OR BENCHMARK)
     # =========================================================================
-    logger.info("\n[4/12] Running SAA (Standard OR)...")
     try:
         saa_model = SampleAverageApproximation(
             n_estimators=100,
@@ -292,12 +406,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"SAA failed: {e}")
+        logger.debug(f"SAA failed: {e}")
 
     # =========================================================================
     # 5. TWO-STAGE STOCHASTIC (SCENARIO OPTIMIZATION)
     # =========================================================================
-    logger.info("\n[5/12] Running Two-Stage Stochastic (Scenario Optimization)...")
     try:
         tss_model = TwoStageStochastic(
             alpha=config.conformal.alpha,
@@ -320,12 +433,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Two-Stage Stochastic failed: {e}")
+        logger.debug(f"Two-Stage Stochastic failed: {e}")
 
     # =========================================================================
     # 6. CONFORMAL PREDICTION (DISTRIBUTION-FREE)
     # =========================================================================
-    logger.info("\n[6/12] Running Conformal Prediction (Distribution-Free)...")
     try:
         cp_model = ConformalPrediction(
             alpha=config.conformal.alpha,
@@ -348,12 +460,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Conformal Prediction failed: {e}")
+        logger.debug(f"Conformal Prediction failed: {e}")
 
     # =========================================================================
     # 7. QUANTILE REGRESSION (DIRECT QUANTILE + CQR)
     # =========================================================================
-    logger.info("\n[7/12] Running Quantile Regression (Direct Quantile)...")
     try:
         qr_model = QuantileRegression(
             alpha=config.quantile_reg.alpha,
@@ -376,14 +487,13 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Quantile Regression failed: {e}")
+        logger.debug(f"Quantile Regression failed: {e}")
 
     # =========================================================================
     # 8-10. DEEP LEARNING MODELS (Optional)
     # =========================================================================
     if run_dl_models:
         # 8. LSTM QUANTILE LOSS (WITHOUT CALIBRATION)
-        logger.info("\n[8/12] Running LSTM Quantile Loss (Uncalibrated)...")
         try:
             lstm_uncal_model = LSTMQuantileLossOnly(
                 alpha=config.lstm.alpha,
@@ -412,10 +522,9 @@ def run_single_window(
                 costs.ordering_cost, costs.holding_cost, costs.stockout_cost
             )
         except Exception as e:
-            logger.error(f"LSTM Quantile Loss failed: {e}")
+            logger.debug(f"LSTM Quantile Loss failed: {e}")
 
         # 9. LSTM + CONFORMAL (WITH CALIBRATION)
-        logger.info("\n[9/12] Running LSTM+Conformal (Calibrated)...")
         try:
             lstm_cal_model = LSTMQuantileRegression(
                 alpha=config.lstm.alpha,
@@ -444,10 +553,9 @@ def run_single_window(
                 costs.ordering_cost, costs.holding_cost, costs.stockout_cost
             )
         except Exception as e:
-            logger.error(f"LSTM+Conformal failed: {e}")
+            logger.debug(f"LSTM+Conformal failed: {e}")
 
         # 10. SPO (DECISION-FOCUSED LEARNING)
-        logger.info("\n[10/12] Running SPO (Decision-Focused)...")
         try:
             spo_model = SPOEndToEnd(
                 alpha=config.lstm.alpha,
@@ -480,12 +588,11 @@ def run_single_window(
                 costs.ordering_cost, costs.holding_cost, costs.stockout_cost
             )
         except Exception as e:
-            logger.error(f"SPO failed: {e}")
+            logger.debug(f"SPO failed: {e}")
 
     # =========================================================================
     # 11. EnbPI + CQR + CVaR (YOUR CONTRIBUTION)
     # =========================================================================
-    logger.info("\n[11/12] Running EnbPI+CQR+CVaR (Your Contribution)...")
     try:
         enbpi_model = EnsembleBatchPI(
             alpha=config.ensemble_batch_pi.alpha,
@@ -511,12 +618,11 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"EnbPI+CQR+CVaR failed: {e}")
+        logger.debug(f"EnbPI+CQR+CVaR failed: {e}")
 
     # =========================================================================
     # 12. SEER (ORACLE - UPPER BOUND)
     # =========================================================================
-    logger.info("\n[12/12] Running Seer (Oracle Upper Bound)...")
     try:
         seer_model = Seer(alpha=0.05, random_state=config.random_seed)
         seer_model.fit(X_train, y_train, X_cal, y_cal)
@@ -533,7 +639,7 @@ def run_single_window(
             costs.ordering_cost, costs.holding_cost, costs.stockout_cost
         )
     except Exception as e:
-        logger.error(f"Seer failed: {e}")
+        logger.debug(f"Seer failed: {e}")
 
     # =========================================================================
     # ALIGN RESULTS TO COMMON LENGTH
@@ -582,6 +688,51 @@ def run_single_window(
     return summary_df, results
 
 
+def run_single_sku(
+    sku_splits: List[RollingWindowSplit],
+    store_id: int,
+    item_id: int,
+    config: ExperimentConfig,
+    run_dl_models: bool = True,
+    verbose: bool = False
+) -> pd.DataFrame:
+    """
+    Run expanding window experiment for a single SKU.
+
+    Parameters
+    ----------
+    sku_splits : List[RollingWindowSplit]
+        List of expanding window splits for this SKU.
+    store_id : int
+        Store ID.
+    item_id : int
+        Item ID.
+    config : ExperimentConfig
+        Experiment configuration.
+    run_dl_models : bool
+        Whether to run deep learning models.
+    verbose : bool
+        Whether to print detailed logs.
+
+    Returns
+    -------
+    pd.DataFrame
+        Results for all windows for this SKU.
+    """
+    all_window_results = []
+
+    for window_split in sku_splits:
+        if verbose:
+            logger.info(f"  Window {window_split.window_idx}: {window_split.test_start_date.date()} to {window_split.test_end_date.date()}")
+
+        summary_df, _ = run_single_window(window_split, config, run_dl_models)
+        summary_df['store_id'] = store_id
+        summary_df['item_id'] = item_id
+        all_window_results.append(summary_df)
+
+    return pd.concat(all_window_results, ignore_index=True)
+
+
 # =============================================================================
 # VISUALIZATION FUNCTIONS
 # =============================================================================
@@ -589,7 +740,8 @@ def run_single_window(
 def create_comprehensive_visualizations(
     combined_df: pd.DataFrame,
     aggregated: pd.DataFrame,
-    output_dir: str
+    output_dir: str,
+    multi_sku: bool = False
 ):
     """
     Create comprehensive visualizations of the experiment results.
@@ -602,6 +754,8 @@ def create_comprehensive_visualizations(
         Aggregated results across windows.
     output_dir : str
         Directory to save plots.
+    multi_sku : bool
+        Whether this is a multi-SKU experiment.
     """
     logger.info("\nCreating visualizations...")
 
@@ -609,7 +763,7 @@ def create_comprehensive_visualizations(
     plt.style.use('seaborn-v0_8-whitegrid')
     sns.set_palette("husl")
 
-    # Define model order (Simple → Advanced → Your Method → Oracle)
+    # Define model order (Simple -> Advanced -> Your Method -> Oracle)
     model_order = [
         'HistoricalQuantile', 'NormalAssumption', 'BootstrappedNewsvendor',
         'SAA', 'TwoStageStochastic', 'ConformalPrediction', 'QuantileRegression',
@@ -625,7 +779,10 @@ def create_comprehensive_visualizations(
     df_plot['Method'] = pd.Categorical(df_plot['Method'], categories=existing_methods, ordered=True)
 
     sns.boxplot(data=df_plot, x='Method', y='CVaR_90', ax=ax)
-    ax.set_title('CVaR-90 Comparison Across All Windows\n(Lower is Better)', fontsize=14, fontweight='bold')
+    title = 'CVaR-90 Comparison Across All Windows'
+    if multi_sku:
+        title += f' and {combined_df["store_id"].nunique()} Stores x {combined_df["item_id"].nunique()} Items'
+    ax.set_title(f'{title}\n(Lower is Better)', fontsize=14, fontweight='bold')
     ax.set_xlabel('Method', fontsize=12)
     ax.set_ylabel('CVaR-90 ($)', fontsize=12)
     ax.tick_params(axis='x', rotation=45)
@@ -646,7 +803,7 @@ def create_comprehensive_visualizations(
             mc = mean_cost[method]
             cov = coverage[method]
             if not np.isnan(cov):
-                marker = '★' if method == 'EnbPI_CQR_CVaR' else 'o'
+                marker = '*' if method == 'EnbPI_CQR_CVaR' else 'o'
                 color = 'red' if method == 'EnbPI_CQR_CVaR' else 'green' if method == 'Seer' else 'blue'
                 size = 200 if method in ['EnbPI_CQR_CVaR', 'Seer'] else 100
                 ax.scatter(cov * 100, mc, s=size, c=color, alpha=0.7, label=get_model_display_name(method))
@@ -699,7 +856,8 @@ def create_comprehensive_visualizations(
         ax = axes[idx // 2, idx % 2]
         for method in ['EnbPI_CQR_CVaR', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
             if method in combined_df['Method'].values:
-                method_data = combined_df[combined_df['Method'] == method].sort_values('window_idx')
+                # Aggregate across SKUs for each window
+                method_data = combined_df[combined_df['Method'] == method].groupby('window_idx')[metric].mean().reset_index()
                 if metric in method_data.columns:
                     ax.plot(method_data['window_idx'], method_data[metric],
                            marker='o', label=get_model_display_name(method), linewidth=2, markersize=6)
@@ -755,13 +913,50 @@ def create_comprehensive_visualizations(
     plt.savefig(os.path.join(output_dir, 'summary_bar_chart.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
+    # 6. Multi-SKU specific visualizations
+    if multi_sku and 'store_id' in combined_df.columns:
+        # Heatmap of CVaR-90 by Store-Item for best method
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        # Get EnbPI results or fall back to best performing method
+        best_method = 'EnbPI_CQR_CVaR' if 'EnbPI_CQR_CVaR' in existing_methods else existing_methods[0]
+        method_df = combined_df[combined_df['Method'] == best_method]
+
+        pivot_data = method_df.groupby(['store_id', 'item_id'])['CVaR_90'].mean().unstack()
+
+        sns.heatmap(pivot_data, annot=True, fmt='.1f', cmap='RdYlGn_r', ax=ax)
+        ax.set_title(f'CVaR-90 by Store-Item ({best_method})', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Item ID', fontsize=12)
+        ax.set_ylabel('Store ID', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cvar90_by_sku.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Performance variance across SKUs
+        fig, ax = plt.subplots(figsize=(14, 6))
+
+        sku_variance = combined_df.groupby(['Method', 'store_id', 'item_id'])['CVaR_90'].mean().reset_index()
+        sku_variance = sku_variance[sku_variance['Method'].isin(existing_methods)]
+        sku_variance['Method'] = pd.Categorical(sku_variance['Method'], categories=existing_methods, ordered=True)
+
+        sns.boxplot(data=sku_variance, x='Method', y='CVaR_90', ax=ax)
+        ax.set_title('CVaR-90 Variance Across SKUs\n(Each box = distribution over store-item combos)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('CVaR-90 ($)', fontsize=12)
+        ax.tick_params(axis='x', rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cvar90_variance_by_sku.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
     logger.info(f"Visualizations saved to {output_dir}")
 
 
 def create_summary_report(
     combined_df: pd.DataFrame,
     aggregated: pd.DataFrame,
-    output_dir: str
+    output_dir: str,
+    store_ids: List[int],
+    item_ids: List[int]
 ) -> str:
     """
     Create a text summary report of the experiment results.
@@ -774,20 +969,32 @@ def create_summary_report(
         Aggregated results across windows.
     output_dir : str
         Directory to save the report.
+    store_ids : List[int]
+        List of store IDs used.
+    item_ids : List[int]
+        List of item IDs used.
 
     Returns
     -------
     str
         The report content.
     """
+    multi_sku = len(store_ids) > 1 or len(item_ids) > 1
+
     report = []
     report.append("=" * 80)
     report.append("COMPREHENSIVE EXPANDING WINDOW EXPERIMENT REPORT")
-    report.append("Simple → Advanced → Your Method")
+    if multi_sku:
+        report.append("Multi-SKU Analysis")
+    report.append("Simple -> Advanced -> Your Method")
     report.append("=" * 80)
     report.append(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append(f"Stores: {store_ids}")
+    report.append(f"Items: {item_ids}")
+    report.append(f"Total SKU Combinations: {len(store_ids) * len(item_ids)}")
     report.append(f"Number of Windows: {combined_df['window_idx'].nunique()}")
     report.append(f"Number of Methods: {combined_df['Method'].nunique()}")
+    report.append(f"Total Observations: {len(combined_df)}")
 
     # Best performers
     report.append("\n" + "-" * 80)
@@ -831,9 +1038,34 @@ def create_summary_report(
         report.append(f"  - CVaR-90 improvement vs SAA: {improvement_vs_saa:+.1f}%")
         report.append(f"  - CVaR-90 improvement vs Normal: {improvement_vs_normal:+.1f}%")
 
+    # Multi-SKU specific statistics
+    if multi_sku and 'store_id' in combined_df.columns:
+        report.append("\n" + "-" * 80)
+        report.append("MULTI-SKU ANALYSIS")
+        report.append("-" * 80)
+
+        # Per-SKU best methods
+        sku_best = combined_df.groupby(['store_id', 'item_id', 'Method'])['CVaR_90'].mean().reset_index()
+        sku_best = sku_best[sku_best['Method'] != 'Seer']  # Exclude oracle
+        sku_winners = sku_best.loc[sku_best.groupby(['store_id', 'item_id'])['CVaR_90'].idxmin()]
+
+        method_wins = sku_winners['Method'].value_counts()
+        report.append(f"\nMethod wins across SKUs (by CVaR-90):")
+        for method, wins in method_wins.items():
+            pct = wins / len(sku_winners) * 100
+            report.append(f"  {get_model_display_name(method)}: {wins} wins ({pct:.1f}%)")
+
+        # Variance analysis
+        report.append(f"\nCVaR-90 standard deviation across SKUs:")
+        for method in ['EnbPI_CQR_CVaR', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
+            if method in combined_df['Method'].values:
+                method_df = combined_df[combined_df['Method'] == method]
+                sku_means = method_df.groupby(['store_id', 'item_id'])['CVaR_90'].mean()
+                report.append(f"  {get_model_display_name(method)}: {sku_means.std():.2f}")
+
     # Full results table
     report.append("\n" + "-" * 80)
-    report.append("AGGREGATED RESULTS (Mean ± Std across windows)")
+    report.append("AGGREGATED RESULTS (Mean +/- Std across all windows and SKUs)")
     report.append("-" * 80)
     report.append("\n" + aggregated.to_string())
 
@@ -848,19 +1080,55 @@ def create_summary_report(
 
 
 # =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def parse_id_range(id_string: str) -> List[int]:
+    """
+    Parse a string of IDs that can be comma-separated or a range.
+
+    Examples:
+        "1,2,3" -> [1, 2, 3]
+        "1-5" -> [1, 2, 3, 4, 5]
+        "1,3,5-8" -> [1, 3, 5, 6, 7, 8]
+    """
+    ids = []
+    for part in id_string.split(','):
+        part = part.strip()
+        if '-' in part:
+            start, end = part.split('-')
+            ids.extend(range(int(start), int(end) + 1))
+        else:
+            ids.append(int(part))
+    return sorted(list(set(ids)))
+
+
+# =============================================================================
 # MAIN FUNCTION
 # =============================================================================
 
-def main(config: ExperimentConfig, run_dl_models: bool = True):
+def main(
+    config: ExperimentConfig,
+    store_ids: List[int],
+    item_ids: List[int],
+    run_dl_models: bool = True,
+    max_windows: Optional[int] = None
+):
     """
-    Main experiment runner.
+    Main experiment runner for multi-SKU expanding window experiment.
 
     Parameters
     ----------
     config : ExperimentConfig
         Experiment configuration.
+    store_ids : List[int]
+        List of store IDs to process.
+    item_ids : List[int]
+        List of item IDs to process.
     run_dl_models : bool
         If True, run deep learning models.
+    max_windows : Optional[int]
+        Maximum number of windows per SKU (for testing).
     """
     # Set random seeds
     np.random.seed(config.random_seed)
@@ -868,28 +1136,34 @@ def main(config: ExperimentConfig, run_dl_models: bool = True):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.random_seed)
 
+    multi_sku = len(store_ids) > 1 or len(item_ids) > 1
+
     logger.info("=" * 80)
     logger.info("COMPREHENSIVE EXPANDING WINDOW CVaR OPTIMIZATION EXPERIMENT")
-    logger.info("Simple → Advanced → Your Method (EnbPI+CQR+CVaR)")
+    if multi_sku:
+        logger.info("MULTI-SKU MODE")
+    logger.info("Simple -> Advanced -> Your Method (EnbPI+CQR+CVaR)")
     logger.info("=" * 80)
     logger.info(f"Device: {config.device}")
-    logger.info(f"Store: {config.data.store_ids[0]}, Item: {config.data.item_ids[0]}")
+    logger.info(f"Stores: {store_ids}")
+    logger.info(f"Items: {item_ids}")
+    logger.info(f"Total SKUs: {len(store_ids) * len(item_ids)}")
     logger.info(f"Run DL Models: {run_dl_models}")
 
     # Create output directory
     os.makedirs(config.results_dir, exist_ok=True)
 
-    # Load expanding window data
+    # Load expanding window data for all SKUs
     logger.info("\nLoading expanding window data...")
     logger.info(f"  Initial train: {config.rolling_window.initial_train_days} days")
     logger.info(f"  Calibration: {config.rolling_window.calibration_days} days")
     logger.info(f"  Test window: {config.rolling_window.test_window_days} days")
     logger.info(f"  Step: {config.rolling_window.step_days} days")
 
-    rolling_splits = load_and_prepare_rolling_data(
+    all_sku_splits = load_expanding_window_data_multi_sku(
         filepath=config.data.filepath,
-        store_id=config.data.store_ids[0],
-        item_id=config.data.item_ids[0],
+        store_ids=store_ids,
+        item_ids=item_ids,
         lag_periods=config.data.lag_features,
         rolling_windows=config.data.rolling_windows,
         initial_train_days=config.rolling_window.initial_train_days,
@@ -898,34 +1172,43 @@ def main(config: ExperimentConfig, run_dl_models: bool = True):
         step_days=config.rolling_window.step_days
     )
 
-    logger.info(f"Created {len(rolling_splits)} expanding windows\n")
+    if not all_sku_splits:
+        logger.error("No valid store-item combinations found! Check your data.")
+        return
 
-    # Run experiment on each window
-    all_window_results = []
-    all_method_results = {}
+    # Limit windows if specified (for testing)
+    if max_windows is not None:
+        for key in all_sku_splits:
+            all_sku_splits[key] = all_sku_splits[key][:max_windows]
 
-    for window_split in rolling_splits:
-        summary_df, method_results = run_single_window(window_split, config, run_dl_models)
-        all_window_results.append(summary_df)
+    total_windows = sum(len(splits) for splits in all_sku_splits.values())
+    logger.info(f"\nTotal SKUs loaded: {len(all_sku_splits)}")
+    logger.info(f"Total windows to process: {total_windows}")
 
-        # Store results for statistical tests
-        for method_name, result in method_results.items():
-            if method_name not in all_method_results:
-                all_method_results[method_name] = []
-            all_method_results[method_name].append(result)
+    # Run experiment on all SKUs
+    all_results = []
 
-        logger.info(f"\nWindow {window_split.window_idx} Results (Top 5 by CVaR-90):")
-        top5 = summary_df.nsmallest(5, 'CVaR_90')[['DisplayName', 'Mean_Cost', 'CVaR_90', 'Coverage']]
-        print(top5.to_string(index=False))
+    with tqdm(total=len(all_sku_splits), desc="Processing SKUs") as pbar:
+        for (store_id, item_id), sku_splits in all_sku_splits.items():
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing Store {store_id}, Item {item_id} ({len(sku_splits)} windows)")
+            logger.info(f"{'='*60}")
 
-    # Aggregate results
+            sku_results = run_single_sku(
+                sku_splits, store_id, item_id, config, run_dl_models, verbose=False
+            )
+            all_results.append(sku_results)
+
+            pbar.update(1)
+
+    # Combine all results
     logger.info("\n" + "=" * 80)
-    logger.info("AGGREGATED RESULTS ACROSS ALL WINDOWS")
+    logger.info("AGGREGATED RESULTS ACROSS ALL WINDOWS AND SKUs")
     logger.info("=" * 80)
 
-    combined_df = pd.concat(all_window_results, ignore_index=True)
+    combined_df = pd.concat(all_results, ignore_index=True)
 
-    # Compute mean and std
+    # Compute mean and std across all windows and SKUs
     aggregated = combined_df.groupby('Method').agg({
         'Mean_Cost': ['mean', 'std'],
         'CVaR_90': ['mean', 'std'],
@@ -949,11 +1232,24 @@ def main(config: ExperimentConfig, run_dl_models: bool = True):
     combined_df.to_csv(all_path, index=False)
     logger.info(f"[OK] Saved all window results: {all_path}")
 
+    # Save per-SKU aggregated results
+    if multi_sku:
+        sku_agg = combined_df.groupby(['store_id', 'item_id', 'Method']).agg({
+            'Mean_Cost': ['mean', 'std'],
+            'CVaR_90': ['mean', 'std'],
+            'CVaR_95': ['mean', 'std'],
+            'Coverage': ['mean', 'std'],
+            'Service_Level': ['mean', 'std'],
+        }).round(2)
+        sku_agg_path = os.path.join(config.results_dir, "comprehensive_by_sku.csv")
+        sku_agg.to_csv(sku_agg_path)
+        logger.info(f"[OK] Saved per-SKU results: {sku_agg_path}")
+
     # Create visualizations
-    create_comprehensive_visualizations(combined_df, aggregated, config.results_dir)
+    create_comprehensive_visualizations(combined_df, aggregated, config.results_dir, multi_sku)
 
     # Create summary report
-    report = create_summary_report(combined_df, aggregated, config.results_dir)
+    report = create_summary_report(combined_df, aggregated, config.results_dir, store_ids, item_ids)
     print("\n" + report)
 
     logger.info("\n" + "=" * 80)
@@ -963,7 +1259,7 @@ def main(config: ExperimentConfig, run_dl_models: bool = True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Comprehensive Expanding Window CVaR Optimization Experiment"
+        description="Comprehensive Multi-SKU Expanding Window CVaR Optimization Experiment"
     )
     parser.add_argument(
         "--output", type=str, default="results/comprehensive_expanding",
@@ -983,15 +1279,32 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--windows", type=int, default=None,
-        help="Limit number of windows (for testing)"
+        help="Limit number of windows per SKU (for testing)"
+    )
+    parser.add_argument(
+        "--stores", type=str, default="1",
+        help="Store IDs (comma-separated or range, e.g., '1,2,3' or '1-5')"
+    )
+    parser.add_argument(
+        "--items", type=str, default="1",
+        help="Item IDs (comma-separated or range, e.g., '1,2,3' or '1-10')"
+    )
+    parser.add_argument(
+        "--data", type=str, default="train.csv",
+        help="Path to data file"
     )
 
     args = parser.parse_args()
+
+    # Parse store and item IDs
+    store_ids = parse_id_range(args.stores)
+    item_ids = parse_id_range(args.items)
 
     # Create config
     config = get_default_config()
     config.results_dir = args.output
     config.rolling_window.enabled = True
+    config.data.filepath = args.data
 
     # Set epochs for DL models
     if args.epochs:
@@ -1000,4 +1313,10 @@ if __name__ == "__main__":
     if args.device:
         config.device = args.device
 
-    main(config, run_dl_models=not args.no_dl)
+    main(
+        config,
+        store_ids=store_ids,
+        item_ids=item_ids,
+        run_dl_models=not args.no_dl,
+        max_windows=args.windows
+    )
