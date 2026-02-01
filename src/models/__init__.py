@@ -17,6 +17,8 @@ from .traditional import (
     QuantileRegression,
     # Ensemble methods
     EnsembleBatchPI,
+    # Robust optimization
+    DistributionallyRobustOptimization,
     # Utilities
     ExpectedValue,
     Seer,
@@ -48,6 +50,7 @@ __all__ = [
     "ConformalPrediction",      # Distribution-free
     "QuantileRegression",       # Direct quantile
     "EnsembleBatchPI",          # EnbPI+CQR
+    "DistributionallyRobustOptimization",  # Wasserstein DRO
     "ExpectedValue",
     "Seer",
 

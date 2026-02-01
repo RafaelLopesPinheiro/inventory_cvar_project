@@ -7,6 +7,9 @@ from .cvar import (
     compute_order_quantities_cvar,
     compute_order_quantities_newsvendor,
     compute_expected_cost,
+    # DRO optimization
+    optimize_wasserstein_dro_single,
+    compute_order_quantities_dro,
 )
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "compute_order_quantities_cvar",
     "compute_order_quantities_newsvendor",
     "compute_expected_cost",
+    # DRO optimization
+    "optimize_wasserstein_dro_single",
+    "compute_order_quantities_dro",
 ]
