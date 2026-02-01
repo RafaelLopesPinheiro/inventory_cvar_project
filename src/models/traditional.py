@@ -1460,6 +1460,371 @@ class EnsembleBatchPI(BaseForecaster):
         return params
 
 
+class DistributionallyRobustOptimization(BaseForecaster):
+    """
+    Distributionally Robust Optimization (DRO) for Inventory Management.
+
+    This method extends the standard CVaR optimization by accounting for
+    uncertainty in the demand distribution itself, not just uncertainty in
+    demand realizations. It optimizes for the worst-case distribution within
+    a Wasserstein ball centered at the empirical distribution.
+
+    Key insight:
+    - Standard CVaR: min_q CVaR_β(Loss(q, D)) assuming D ~ P̂ (empirical)
+    - DRO: min_q max_{P: W(P, P̂) ≤ ε} CVaR_β(Loss(q, D_P))
+
+    The Wasserstein ball captures the idea that the true distribution may
+    differ from our empirical estimate. The radius ε controls the level of
+    robustness (larger ε = more robust but more conservative).
+
+    When to use DRO over standard CVaR:
+    1. Cross-store/cross-SKU generalization: When models trained on one
+       SKU are applied to another with potentially different distribution
+    2. Seasonal/trend shifts: When future demand patterns may differ from
+       historical data
+    3. Limited data: When sample size is small and empirical distribution
+       may not accurately represent the true distribution
+    4. High-stakes decisions: When the cost of distribution misspecification
+       is high
+
+    The method:
+    1. Train a point predictor (Random Forest) for demand forecasting
+    2. Estimate prediction intervals using conformal calibration
+    3. Generate demand scenarios from the prediction intervals
+    4. Solve the Wasserstein DRO problem for each day's order quantity
+
+    Mathematical formulation (Wasserstein DRO with CVaR):
+    min_{q, λ≥0} λε + E_P̂[sup_d (ℓ_β(q, d) - λ·|d - D̂|)]
+
+    where:
+    - ε is the Wasserstein ball radius
+    - λ is the dual variable (transport cost penalty)
+    - ℓ_β is the CVaR-transformed newsvendor loss
+    - D̂ is a sample from the empirical distribution
+
+    References
+    ----------
+    - Mohajerin Esfahani & Kuhn (2018) "Data-driven distributionally robust
+      optimization using the Wasserstein metric"
+    - Blanchet & Murthy (2019) "Quantifying distributional model risk via
+      optimal transport"
+    - Gao & Kleywegt (2022) "Distributionally Robust Stochastic Optimization
+      with Wasserstein Distance"
+    - Rahimian & Mehrotra (2019) "Distributionally Robust Optimization: A Review"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        epsilon: float = 0.1,
+        n_estimators: int = 100,
+        max_depth: int = 10,
+        n_scenarios: int = 500,
+        ordering_cost: float = 10.0,
+        holding_cost: float = 2.0,
+        stockout_cost: float = 50.0,
+        cvar_beta: float = 0.90,
+        adaptive_epsilon: bool = True,
+        random_state: int = 42
+    ):
+        """
+        Initialize the Distributionally Robust Optimization model.
+
+        Parameters
+        ----------
+        alpha : float
+            Significance level for prediction intervals (1-alpha coverage).
+        epsilon : float
+            Wasserstein ball radius. Controls the level of robustness.
+            - Small epsilon (0.01-0.05): Mild robustness, close to SAA
+            - Medium epsilon (0.1-0.3): Moderate robustness, recommended default
+            - Large epsilon (0.5+): High robustness, may be too conservative
+        n_estimators : int
+            Number of trees in the Random Forest point predictor.
+        max_depth : int
+            Maximum depth of trees in the Random Forest.
+        n_scenarios : int
+            Number of demand scenarios for DRO optimization.
+        ordering_cost : float
+            Cost per unit ordered.
+        holding_cost : float
+            Cost per unit of overage (excess inventory).
+        stockout_cost : float
+            Cost per unit of underage (lost sales).
+        cvar_beta : float
+            CVaR level (tail probability). Default 0.90 means minimizing
+            the average of the worst 10% scenarios.
+        adaptive_epsilon : bool
+            If True, adapt epsilon based on prediction interval width.
+            Wider intervals suggest more uncertainty, warranting larger epsilon.
+        random_state : int
+            Random seed for reproducibility.
+        """
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.epsilon = epsilon
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.n_scenarios = n_scenarios
+        self.ordering_cost = ordering_cost
+        self.holding_cost = holding_cost
+        self.stockout_cost = stockout_cost
+        self.cvar_beta = cvar_beta
+        self.adaptive_epsilon = adaptive_epsilon
+
+        # Point predictor
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+
+        # Conformal calibration for prediction intervals
+        self.q_conformal: Optional[float] = None
+
+        # Stored quantities for analysis
+        self.residuals: Optional[np.ndarray] = None
+        self.residual_std: Optional[float] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray
+    ) -> "DistributionallyRobustOptimization":
+        """
+        Train the DRO model.
+
+        Training proceeds in two phases:
+        1. Train point predictor on training data
+        2. Compute conformal calibration on calibration data
+
+        Parameters
+        ----------
+        X_train : np.ndarray
+            Training features.
+        y_train : np.ndarray
+            Training targets.
+        X_cal : np.ndarray
+            Calibration features.
+        y_cal : np.ndarray
+            Calibration targets.
+
+        Returns
+        -------
+        self
+        """
+        logger.info("Training Distributionally Robust Optimization (DRO) model...")
+        logger.info(f"  Wasserstein epsilon: {self.epsilon}")
+        logger.info(f"  CVaR beta: {self.cvar_beta}")
+        logger.info(f"  Adaptive epsilon: {self.adaptive_epsilon}")
+
+        # Phase 1: Train point predictor
+        logger.info("Phase 1: Training point predictor...")
+        self.model.fit(X_train, y_train)
+
+        # Phase 2: Conformal calibration for prediction intervals
+        logger.info("Phase 2: Computing conformal calibration...")
+        cal_predictions = self.model.predict(X_cal)
+        self.residuals = y_cal - cal_predictions
+        self.residual_std = np.std(self.residuals)
+
+        # Compute conformal quantile
+        nonconformity_scores = np.abs(self.residuals)
+        n = len(y_cal)
+        quantile_level = np.ceil((n + 1) * (1 - self.alpha)) / n
+        self.q_conformal = np.quantile(nonconformity_scores, min(quantile_level, 1.0))
+
+        logger.info(f"  Residual std: {self.residual_std:.2f}")
+        logger.info(f"  Conformal quantile: {self.q_conformal:.2f}")
+
+        self._is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions with conformal prediction intervals.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features for prediction.
+
+        Returns
+        -------
+        PredictionResult
+            Point predictions with conformal intervals.
+        """
+        self._check_is_fitted()
+
+        point_pred = self.model.predict(X)
+        lower = point_pred - self.q_conformal
+        upper = point_pred + self.q_conformal
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def compute_order_quantities(
+        self,
+        X: np.ndarray,
+        point_pred: Optional[np.ndarray] = None,
+        lower: Optional[np.ndarray] = None,
+        upper: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Compute DRO-optimal order quantities using Wasserstein robustness.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features for prediction.
+        point_pred : np.ndarray, optional
+            Pre-computed point predictions. If None, will compute from X.
+        lower : np.ndarray, optional
+            Pre-computed lower bounds. If None, will compute from X.
+        upper : np.ndarray, optional
+            Pre-computed upper bounds. If None, will compute from X.
+
+        Returns
+        -------
+        np.ndarray
+            Optimal robust order quantities.
+        """
+        self._check_is_fitted()
+
+        # Get predictions if not provided
+        if point_pred is None or lower is None or upper is None:
+            pred = self.predict(X)
+            point_pred = pred.point
+            lower = pred.lower
+            upper = pred.upper
+
+        rng = np.random.RandomState(self.random_state)
+        order_quantities = []
+
+        for i in range(len(X)):
+            # Sample demand scenarios from prediction interval
+            demand_samples = rng.uniform(lower[i], upper[i], self.n_scenarios)
+
+            # Compute epsilon for this prediction
+            if self.adaptive_epsilon:
+                # Scale epsilon by interval width relative to mean
+                interval_width = upper[i] - lower[i]
+                relative_uncertainty = interval_width / max(point_pred[i], 1.0)
+                effective_epsilon = self.epsilon * (1 + relative_uncertainty)
+            else:
+                effective_epsilon = self.epsilon
+
+            # Solve Wasserstein DRO problem
+            q_opt = self._optimize_dro_single(demand_samples, effective_epsilon)
+            order_quantities.append(q_opt)
+
+        return np.array(order_quantities)
+
+    def _optimize_dro_single(
+        self,
+        demand_samples: np.ndarray,
+        epsilon: float
+    ) -> float:
+        """
+        Solve the Wasserstein DRO problem for a single time period.
+
+        Uses the dual formulation for tractability.
+
+        Parameters
+        ----------
+        demand_samples : np.ndarray
+            Empirical demand samples.
+        epsilon : float
+            Wasserstein ball radius.
+
+        Returns
+        -------
+        float
+            Optimal robust order quantity.
+        """
+        n_samples = len(demand_samples)
+
+        # Lipschitz constant of newsvendor loss w.r.t. demand
+        lipschitz_constant = max(self.holding_cost, self.stockout_cost)
+
+        def newsvendor_loss_single(q: float, d: float) -> float:
+            """Single-sample newsvendor loss."""
+            overage = max(0, q - d)
+            underage = max(0, d - q)
+            return (self.ordering_cost * q +
+                    self.holding_cost * overage +
+                    self.stockout_cost * underage)
+
+        def dro_objective(x: np.ndarray) -> float:
+            """Wasserstein DRO objective with CVaR."""
+            q, lam, tau = x
+
+            if lam < 0:
+                return 1e10
+
+            worst_case_losses = np.zeros(n_samples)
+
+            for i, d_hat in enumerate(demand_samples):
+                if lam >= lipschitz_constant:
+                    # Adversary is too expensive, use empirical sample
+                    worst_case_losses[i] = newsvendor_loss_single(q, d_hat)
+                else:
+                    # Compute base loss at empirical point
+                    base_loss = newsvendor_loss_single(q, d_hat)
+
+                    # Add worst-case margin
+                    if q <= d_hat:
+                        marginal_gain = self.stockout_cost - lam
+                    else:
+                        marginal_gain = (self.holding_cost - lam
+                                        if lam < self.holding_cost else 0)
+
+                    worst_case_losses[i] = base_loss + max(0, marginal_gain) * epsilon
+
+            # CVaR over worst-case losses
+            cvar_term = tau + (1 / (n_samples * (1 - self.cvar_beta))) * np.sum(
+                np.maximum(0, worst_case_losses - tau)
+            )
+
+            return lam * epsilon + cvar_term
+
+        # Initial guess
+        q0 = np.mean(demand_samples)
+        lam0 = lipschitz_constant
+        tau0 = np.median([newsvendor_loss_single(q0, d) for d in demand_samples])
+
+        # Bounds
+        bounds = [(0, None), (0, None), (None, None)]
+
+        result = minimize(
+            dro_objective,
+            [q0, lam0, tau0],
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+
+        return max(0, result.x[0])
+
+    def get_params(self) -> dict:
+        """Get model parameters."""
+        params = super().get_params()
+        params.update({
+            "epsilon": self.epsilon,
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "n_scenarios": self.n_scenarios,
+            "ordering_cost": self.ordering_cost,
+            "holding_cost": self.holding_cost,
+            "stockout_cost": self.stockout_cost,
+            "cvar_beta": self.cvar_beta,
+            "adaptive_epsilon": self.adaptive_epsilon,
+            "q_conformal": self.q_conformal,
+            "residual_std": self.residual_std
+        })
+        return params
+
+
 class Seer(BaseForecaster):
     """
     Seer (Perfect Foresight) Oracle Baseline.

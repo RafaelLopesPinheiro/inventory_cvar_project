@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
-Comprehensive Multi-SKU Expanding Window Experiment: Simple -> Advanced -> Your Method
+Comprehensive Multi-SKU Expanding Window Experiment: Simple -> Advanced -> Your Method -> DRO
 
-This script implements a rigorous comparison of 12 forecasting methods for
+This script implements a rigorous comparison of 13 forecasting methods for
 inventory optimization using expanding window cross-validation across
 MULTIPLE store-item (SKU) combinations.
 
-Model Hierarchy (Simple -> Advanced -> Your Method):
-==================================================
+Model Hierarchy (Simple -> Advanced -> Your Method -> DRO -> Oracle):
+=====================================================================
 1. Historical Quantile      - Naive empirical quantile baseline
 2. Normal Assumption        - Parametric Gaussian assumption
 3. Bootstrapped Newsvendor  - Resampling-based uncertainty quantification
@@ -19,7 +19,8 @@ Model Hierarchy (Simple -> Advanced -> Your Method):
 9. LSTM+Conformal           - Deep learning WITH conformal calibration
 10. SPO                     - Decision-focused deep learning
 11. EnbPI+CQR+CVaR          - Your contribution (ensemble + CQR + CVaR)
-12. Seer                    - Oracle upper bound (perfect foresight)
+12. DRO                     - Distributionally Robust Optimization (Wasserstein)
+13. Seer                    - Oracle upper bound (perfect foresight)
 
 Key Experimental Design:
 ========================
@@ -87,6 +88,7 @@ from src.models import (
     ConformalPrediction,
     QuantileRegression,
     EnsembleBatchPI,
+    DistributionallyRobustOptimization,
     Seer,
     # Deep learning models
     LSTMQuantileLossOnly,
@@ -132,7 +134,8 @@ MODEL_CATEGORIES = {
     "9_DL_Calibrated": ["LSTMConformal"],
     "10_DecisionFocused": ["SPO"],
     "11_YourContribution": ["EnbPI_CQR_CVaR"],
-    "12_Oracle": ["Seer"],
+    "12_RobustOptimization": ["DRO"],
+    "13_Oracle": ["Seer"],
 }
 
 
@@ -150,7 +153,8 @@ def get_model_display_name(method_name: str) -> str:
         "LSTMConformal": "9. LSTM+Conformal",
         "SPO": "10. SPO",
         "EnbPI_CQR_CVaR": "11. EnbPI+CQR+CVaR",
-        "Seer": "12. Seer (Oracle)",
+        "DRO": "12. DRO (Wasserstein)",
+        "Seer": "13. Seer (Oracle)",
     }
     return display_names.get(method_name, method_name)
 
@@ -621,7 +625,37 @@ def run_single_window(
         logger.debug(f"EnbPI+CQR+CVaR failed: {e}")
 
     # =========================================================================
-    # 12. SEER (ORACLE - UPPER BOUND)
+    # 12. DRO (DISTRIBUTIONALLY ROBUST OPTIMIZATION)
+    # =========================================================================
+    try:
+        dro_model = DistributionallyRobustOptimization(
+            alpha=config.conformal.alpha,
+            epsilon=0.1,  # Wasserstein ball radius
+            n_estimators=config.conformal.n_estimators,
+            max_depth=config.conformal.max_depth,
+            n_scenarios=500,
+            ordering_cost=costs.ordering_cost,
+            holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost,
+            cvar_beta=config.cvar.beta,
+            adaptive_epsilon=True,
+            random_state=config.random_seed
+        )
+        dro_model.fit(X_train, y_train, X_cal, y_cal)
+        dro_pred = dro_model.predict(X_test)
+        dro_orders = dro_model.compute_order_quantities(
+            X_test, dro_pred.point, dro_pred.lower, dro_pred.upper
+        )
+        results["DRO"] = compute_all_metrics(
+            "DRO", y_test, dro_pred.point, dro_orders,
+            dro_pred.lower, dro_pred.upper,
+            costs.ordering_cost, costs.holding_cost, costs.stockout_cost
+        )
+    except Exception as e:
+        logger.debug(f"DRO failed: {e}")
+
+    # =========================================================================
+    # 13. SEER (ORACLE - UPPER BOUND)
     # =========================================================================
     try:
         seer_model = Seer(alpha=0.05, random_state=config.random_seed)
@@ -763,11 +797,11 @@ def create_comprehensive_visualizations(
     plt.style.use('seaborn-v0_8-whitegrid')
     sns.set_palette("husl")
 
-    # Define model order (Simple -> Advanced -> Your Method -> Oracle)
+    # Define model order (Simple -> Advanced -> Your Method -> DRO -> Oracle)
     model_order = [
         'HistoricalQuantile', 'NormalAssumption', 'BootstrappedNewsvendor',
         'SAA', 'TwoStageStochastic', 'ConformalPrediction', 'QuantileRegression',
-        'LSTMQuantileLoss', 'LSTMConformal', 'SPO', 'EnbPI_CQR_CVaR', 'Seer'
+        'LSTMQuantileLoss', 'LSTMConformal', 'SPO', 'EnbPI_CQR_CVaR', 'DRO', 'Seer'
     ]
 
     # Filter to existing methods
@@ -854,7 +888,7 @@ def create_comprehensive_visualizations(
 
     for idx, metric in enumerate(['Mean_Cost', 'CVaR_90', 'Coverage', 'Service_Level']):
         ax = axes[idx // 2, idx % 2]
-        for method in ['EnbPI_CQR_CVaR', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
+        for method in ['EnbPI_CQR_CVaR', 'DRO', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
             if method in combined_df['Method'].values:
                 # Aggregate across SKUs for each window
                 method_data = combined_df[combined_df['Method'] == method].groupby('window_idx')[metric].mean().reset_index()
@@ -1057,7 +1091,7 @@ def create_summary_report(
 
         # Variance analysis
         report.append(f"\nCVaR-90 standard deviation across SKUs:")
-        for method in ['EnbPI_CQR_CVaR', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
+        for method in ['EnbPI_CQR_CVaR', 'DRO', 'ConformalPrediction', 'NormalAssumption', 'SAA']:
             if method in combined_df['Method'].values:
                 method_df = combined_df[combined_df['Method'] == method]
                 sku_means = method_df.groupby(['store_id', 'item_id'])['CVaR_90'].mean()
