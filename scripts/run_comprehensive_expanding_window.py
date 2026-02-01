@@ -57,6 +57,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -292,6 +293,7 @@ def run_single_window(
         Results summary for this window.
     """
     results = {}
+    timings = {}  # Store execution time for each model (in seconds)
     costs = config.cost
 
     # Data for traditional methods
@@ -317,6 +319,7 @@ def run_single_window(
     # 1. HISTORICAL QUANTILE (NAIVE BASELINE)
     # =========================================================================
     try:
+        start_time = time.time()
         hq_model = HistoricalQuantile(alpha=config.conformal.alpha, random_state=config.random_seed)
         hq_model.fit(X_train, y_train, X_cal, y_cal)
         hq_pred = hq_model.predict(X_test)
@@ -327,6 +330,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["HistoricalQuantile"] = time.time() - start_time
         results["HistoricalQuantile"] = compute_all_metrics(
             "HistoricalQuantile", y_test, hq_pred.point, hq_orders,
             hq_pred.lower, hq_pred.upper,
@@ -339,6 +343,7 @@ def run_single_window(
     # 2. NORMAL ASSUMPTION (PARAMETRIC)
     # =========================================================================
     try:
+        start_time = time.time()
         normal_model = NormalAssumption(
             alpha=config.normal.alpha,
             n_estimators=config.normal.n_estimators,
@@ -354,6 +359,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["NormalAssumption"] = time.time() - start_time
         results["NormalAssumption"] = compute_all_metrics(
             "NormalAssumption", y_test, normal_pred.point, normal_orders,
             normal_pred.lower, normal_pred.upper,
@@ -366,6 +372,7 @@ def run_single_window(
     # 3. BOOTSTRAPPED NEWSVENDOR (RESAMPLING)
     # =========================================================================
     try:
+        start_time = time.time()
         boot_model = BootstrappedNewsvendor(
             alpha=config.conformal.alpha,
             n_bootstrap=1000,
@@ -382,6 +389,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["BootstrappedNewsvendor"] = time.time() - start_time
         results["BootstrappedNewsvendor"] = compute_all_metrics(
             "BootstrappedNewsvendor", y_test, boot_pred.point, boot_orders,
             boot_pred.lower, boot_pred.upper,
@@ -394,6 +402,7 @@ def run_single_window(
     # 4. SAA (STANDARD OR BENCHMARK)
     # =========================================================================
     try:
+        start_time = time.time()
         saa_model = SampleAverageApproximation(
             n_estimators=100,
             max_depth=10,
@@ -404,6 +413,7 @@ def run_single_window(
         saa_model.fit(X_train, y_train, X_cal, y_cal)
         saa_pred = saa_model.predict(X_test)
         saa_orders = saa_model.compute_order_quantities(X_test)
+        timings["SAA"] = time.time() - start_time
         results["SAA"] = compute_all_metrics(
             "SAA", y_test, saa_pred.point, saa_orders,
             None, None,
@@ -416,6 +426,7 @@ def run_single_window(
     # 5. TWO-STAGE STOCHASTIC (SCENARIO OPTIMIZATION)
     # =========================================================================
     try:
+        start_time = time.time()
         tss_model = TwoStageStochastic(
             alpha=config.conformal.alpha,
             n_scenarios=500,
@@ -431,6 +442,7 @@ def run_single_window(
         tss_model.fit(X_train, y_train, X_cal, y_cal)
         tss_pred = tss_model.predict(X_test)
         tss_orders = tss_model.compute_order_quantities(X_test)
+        timings["TwoStageStochastic"] = time.time() - start_time
         results["TwoStageStochastic"] = compute_all_metrics(
             "TwoStageStochastic", y_test, tss_pred.point, tss_orders,
             tss_pred.lower, tss_pred.upper,
@@ -443,6 +455,7 @@ def run_single_window(
     # 6. CONFORMAL PREDICTION (DISTRIBUTION-FREE)
     # =========================================================================
     try:
+        start_time = time.time()
         cp_model = ConformalPrediction(
             alpha=config.conformal.alpha,
             n_estimators=config.conformal.n_estimators,
@@ -458,6 +471,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["ConformalPrediction"] = time.time() - start_time
         results["ConformalPrediction"] = compute_all_metrics(
             "ConformalPrediction", y_test, cp_pred.point, cp_orders,
             cp_pred.lower, cp_pred.upper,
@@ -470,6 +484,7 @@ def run_single_window(
     # 7. QUANTILE REGRESSION (DIRECT QUANTILE + CQR)
     # =========================================================================
     try:
+        start_time = time.time()
         qr_model = QuantileRegression(
             alpha=config.quantile_reg.alpha,
             n_estimators=config.quantile_reg.n_estimators,
@@ -485,6 +500,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["QuantileRegression"] = time.time() - start_time
         results["QuantileRegression"] = compute_all_metrics(
             "QuantileRegression", y_test, qr_pred.point, qr_orders,
             qr_pred.lower, qr_pred.upper,
@@ -499,6 +515,7 @@ def run_single_window(
     if run_dl_models:
         # 8. LSTM QUANTILE LOSS (WITHOUT CALIBRATION)
         try:
+            start_time = time.time()
             lstm_uncal_model = LSTMQuantileLossOnly(
                 alpha=config.lstm.alpha,
                 sequence_length=config.data.sequence_length,
@@ -520,6 +537,7 @@ def run_single_window(
                 stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
                 verbose=False
             )
+            timings["LSTMQuantileLoss"] = time.time() - start_time
             results["LSTMQuantileLoss"] = compute_all_metrics(
                 "LSTMQuantileLoss", y_test_seq, lstm_uncal_pred.point, lstm_uncal_orders,
                 lstm_uncal_pred.lower, lstm_uncal_pred.upper,
@@ -530,6 +548,7 @@ def run_single_window(
 
         # 9. LSTM + CONFORMAL (WITH CALIBRATION)
         try:
+            start_time = time.time()
             lstm_cal_model = LSTMQuantileRegression(
                 alpha=config.lstm.alpha,
                 sequence_length=config.data.sequence_length,
@@ -551,6 +570,7 @@ def run_single_window(
                 stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
                 verbose=False
             )
+            timings["LSTMConformal"] = time.time() - start_time
             results["LSTMConformal"] = compute_all_metrics(
                 "LSTMConformal", y_test_seq, lstm_cal_pred.point, lstm_cal_orders,
                 lstm_cal_pred.lower, lstm_cal_pred.upper,
@@ -561,6 +581,7 @@ def run_single_window(
 
         # 10. SPO (DECISION-FOCUSED LEARNING)
         try:
+            start_time = time.time()
             spo_model = SPOEndToEnd(
                 alpha=config.lstm.alpha,
                 sequence_length=config.data.sequence_length,
@@ -586,6 +607,7 @@ def run_single_window(
                 stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
                 verbose=False
             )
+            timings["SPO"] = time.time() - start_time
             results["SPO"] = compute_all_metrics(
                 "SPO", y_test_seq, spo_pred.point, spo_orders,
                 spo_pred.lower, spo_pred.upper,
@@ -598,6 +620,7 @@ def run_single_window(
     # 11. EnbPI + CQR + CVaR (YOUR CONTRIBUTION)
     # =========================================================================
     try:
+        start_time = time.time()
         enbpi_model = EnsembleBatchPI(
             alpha=config.ensemble_batch_pi.alpha,
             n_ensemble=config.ensemble_batch_pi.n_ensemble,
@@ -616,6 +639,7 @@ def run_single_window(
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False
         )
+        timings["EnbPI_CQR_CVaR"] = time.time() - start_time
         results["EnbPI_CQR_CVaR"] = compute_all_metrics(
             "EnbPI_CQR_CVaR", y_test, enbpi_pred.point, enbpi_orders,
             enbpi_pred.lower, enbpi_pred.upper,
@@ -628,6 +652,7 @@ def run_single_window(
     # 12. DRO (DISTRIBUTIONALLY ROBUST OPTIMIZATION)
     # =========================================================================
     try:
+        start_time = time.time()
         dro_model = DistributionallyRobustOptimization(
             alpha=config.conformal.alpha,
             epsilon=0.1,  # Wasserstein ball radius
@@ -646,6 +671,7 @@ def run_single_window(
         dro_orders = dro_model.compute_order_quantities(
             X_test, dro_pred.point, dro_pred.lower, dro_pred.upper
         )
+        timings["DRO"] = time.time() - start_time
         results["DRO"] = compute_all_metrics(
             "DRO", y_test, dro_pred.point, dro_orders,
             dro_pred.lower, dro_pred.upper,
@@ -658,6 +684,7 @@ def run_single_window(
     # 13. SEER (ORACLE - UPPER BOUND)
     # =========================================================================
     try:
+        start_time = time.time()
         seer_model = Seer(alpha=0.05, random_state=config.random_seed)
         seer_model.fit(X_train, y_train, X_cal, y_cal)
         seer_pred = seer_model.predict_with_actuals(X_test, y_test)
@@ -667,6 +694,7 @@ def run_single_window(
             holding_cost=costs.holding_cost,
             stockout_cost=costs.stockout_cost
         )
+        timings["Seer"] = time.time() - start_time
         results["Seer"] = compute_all_metrics(
             "Seer", y_test, seer_pred.point, seer_orders,
             seer_pred.lower, seer_pred.upper,
@@ -711,6 +739,7 @@ def run_single_window(
             'MAE': result.forecast_metrics.mae,
             'RMSE': result.forecast_metrics.rmse,
             'MAPE': result.forecast_metrics.mape,
+            'Time_Seconds': timings.get(method_name, np.nan),
         }
         summary_data.append(row)
 
@@ -982,6 +1011,71 @@ def create_comprehensive_visualizations(
         plt.savefig(os.path.join(output_dir, 'cvar90_variance_by_sku.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
+    # 7. Timing Comparison
+    if 'Time_Seconds' in combined_df.columns:
+        fig, ax = plt.subplots(figsize=(14, 6))
+
+        # Get mean timing for each method
+        timing_df = combined_df.groupby('Method')['Time_Seconds'].mean().reset_index()
+        timing_df = timing_df[timing_df['Method'].isin(existing_methods)]
+        timing_df['Method'] = pd.Categorical(timing_df['Method'], categories=existing_methods, ordered=True)
+        timing_df = timing_df.sort_values('Method')
+
+        colors = ['red' if m == 'EnbPI_CQR_CVaR' else 'purple' if m == 'DRO' else
+                  'green' if m == 'Seer' else 'orange' if 'LSTM' in m or m == 'SPO' else 'steelblue'
+                  for m in timing_df['Method']]
+
+        bars = ax.bar(range(len(timing_df)), timing_df['Time_Seconds'], color=colors, alpha=0.8)
+        ax.set_xticks(range(len(timing_df)))
+        ax.set_xticklabels([m.replace('_', '\n') for m in timing_df['Method']], rotation=45, ha='right', fontsize=9)
+        ax.set_ylabel('Time (seconds)', fontsize=12)
+        ax.set_title('Average Execution Time per Window (Training + Prediction + Optimization)',
+                    fontsize=14, fontweight='bold')
+
+        # Add value labels on bars
+        for bar, val in zip(bars, timing_df['Time_Seconds']):
+            if not np.isnan(val):
+                ax.annotate(f'{val:.1f}s', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                           ha='center', va='bottom', fontsize=8)
+
+        ax.set_yscale('log')  # Log scale for better visibility of small times
+        ax.set_ylabel('Time (seconds, log scale)', fontsize=12)
+        ax.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'timing_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # 8. Timing vs CVaR-90 Trade-off
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        # Merge timing with CVaR data
+        cvar_timing = combined_df.groupby('Method').agg({
+            'Time_Seconds': 'mean',
+            'CVaR_90': 'mean'
+        }).reset_index()
+        cvar_timing = cvar_timing[cvar_timing['Method'].isin(existing_methods)]
+
+        for _, row in cvar_timing.iterrows():
+            method = row['Method']
+            if np.isnan(row['Time_Seconds']) or np.isnan(row['CVaR_90']):
+                continue
+            marker = '*' if method == 'EnbPI_CQR_CVaR' else 's' if method == 'DRO' else 'o'
+            color = ('red' if method == 'EnbPI_CQR_CVaR' else 'purple' if method == 'DRO' else
+                     'green' if method == 'Seer' else 'orange' if 'LSTM' in method or method == 'SPO' else 'blue')
+            size = 200 if method in ['EnbPI_CQR_CVaR', 'DRO', 'Seer'] else 100
+            ax.scatter(row['Time_Seconds'], row['CVaR_90'], s=size, c=color, alpha=0.7, marker=marker)
+            ax.annotate(method.replace('_', '\n'), (row['Time_Seconds'], row['CVaR_90']),
+                       fontsize=8, ha='left', va='bottom')
+
+        ax.set_xlabel('Execution Time (seconds)', fontsize=12)
+        ax.set_ylabel('CVaR-90 ($)', fontsize=12)
+        ax.set_title('Execution Time vs CVaR-90 Trade-off\n(Bottom-left is better)', fontsize=14, fontweight='bold')
+        ax.set_xscale('log')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'timing_vs_cvar_tradeoff.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
     logger.info(f"Visualizations saved to {output_dir}")
 
 
@@ -1102,6 +1196,49 @@ def create_summary_report(
     report.append("AGGREGATED RESULTS (Mean +/- Std across all windows and SKUs)")
     report.append("-" * 80)
     report.append("\n" + aggregated.to_string())
+
+    # Timing analysis
+    if 'Time_Seconds' in combined_df.columns:
+        report.append("\n" + "-" * 80)
+        report.append("EXECUTION TIME ANALYSIS")
+        report.append("-" * 80)
+
+        timing_stats = combined_df.groupby('Method')['Time_Seconds'].agg(['mean', 'std', 'min', 'max'])
+        timing_stats = timing_stats.sort_values('mean')
+
+        report.append("\nAverage Execution Time per Window (sorted by speed):")
+        report.append(f"{'Method':<25} {'Mean (s)':<12} {'Std (s)':<12} {'Min (s)':<12} {'Max (s)':<12}")
+        report.append("-" * 73)
+
+        for method, row in timing_stats.iterrows():
+            if not np.isnan(row['mean']):
+                report.append(f"{method:<25} {row['mean']:>10.2f}s {row['std']:>10.2f}s {row['min']:>10.2f}s {row['max']:>10.2f}s")
+
+        # Speedup comparisons
+        report.append("\nSpeedup Comparison (relative to EnbPI+CQR+CVaR):")
+        if 'EnbPI_CQR_CVaR' in timing_stats.index:
+            enbpi_time = timing_stats.loc['EnbPI_CQR_CVaR', 'mean']
+            for method in timing_stats.index:
+                if method != 'EnbPI_CQR_CVaR' and not np.isnan(timing_stats.loc[method, 'mean']):
+                    method_time = timing_stats.loc[method, 'mean']
+                    if method_time > 0:
+                        speedup = enbpi_time / method_time
+                        if speedup >= 1:
+                            report.append(f"  {method}: {speedup:.1f}x slower than EnbPI")
+                        else:
+                            report.append(f"  {method}: {1/speedup:.1f}x faster than EnbPI")
+
+        # DRO vs EnbPI timing
+        if 'DRO' in timing_stats.index and 'EnbPI_CQR_CVaR' in timing_stats.index:
+            dro_time = timing_stats.loc['DRO', 'mean']
+            enbpi_time = timing_stats.loc['EnbPI_CQR_CVaR', 'mean']
+            report.append(f"\n[DRO vs EnbPI]")
+            report.append(f"  DRO execution time: {dro_time:.2f}s")
+            report.append(f"  EnbPI execution time: {enbpi_time:.2f}s")
+            if dro_time > enbpi_time:
+                report.append(f"  DRO is {dro_time/enbpi_time:.1f}x slower than EnbPI")
+            else:
+                report.append(f"  DRO is {enbpi_time/dro_time:.1f}x faster than EnbPI")
 
     # Save report
     report_text = "\n".join(report)
