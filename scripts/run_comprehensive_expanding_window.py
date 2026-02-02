@@ -84,6 +84,11 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+
+# Determine optimal number of workers for parallel processing
+_NUM_WORKERS = min(multiprocessing.cpu_count(), 8)
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1726,21 +1731,52 @@ def main(
     logger.info(f"\nTotal SKUs loaded: {len(all_sku_splits)}")
     logger.info(f"Total windows to process: {total_windows}")
 
+    # Determine parallel execution strategy
+    # For DL models, use sequential to avoid GPU contention
+    # For traditional models only, use parallel SKU processing
+    use_parallel_skus = not run_dl_models and len(all_sku_splits) > 1
+    n_parallel_skus = min(_NUM_WORKERS, len(all_sku_splits)) if use_parallel_skus else 1
+
+    logger.info(f"Parallel SKU processing: {use_parallel_skus} ({n_parallel_skus} workers)")
+
     # Run experiment on all SKUs
     all_results = []
 
-    with tqdm(total=len(all_sku_splits), desc="Processing SKUs") as pbar:
-        for (store_id, item_id), sku_splits in all_sku_splits.items():
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing Store {store_id}, Item {item_id} ({len(sku_splits)} windows)")
-            logger.info(f"{'='*60}")
-
-            sku_results = run_single_sku(
+    if use_parallel_skus:
+        # Parallel SKU processing for traditional models only
+        def process_sku(args):
+            (store_id, item_id), sku_splits = args
+            return run_single_sku(
                 sku_splits, store_id, item_id, config, run_dl_models, verbose=False
             )
-            all_results.append(sku_results)
 
-            pbar.update(1)
+        sku_items = list(all_sku_splits.items())
+
+        with ThreadPoolExecutor(max_workers=n_parallel_skus) as executor:
+            futures = {executor.submit(process_sku, item): item for item in sku_items}
+
+            with tqdm(total=len(futures), desc="Processing SKUs (parallel)") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        sku_results = future.result()
+                        all_results.append(sku_results)
+                    except Exception as e:
+                        logger.error(f"Error processing SKU: {e}")
+                    pbar.update(1)
+    else:
+        # Sequential processing (for DL models or single SKU)
+        with tqdm(total=len(all_sku_splits), desc="Processing SKUs") as pbar:
+            for (store_id, item_id), sku_splits in all_sku_splits.items():
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing Store {store_id}, Item {item_id} ({len(sku_splits)} windows)")
+                logger.info(f"{'='*60}")
+
+                sku_results = run_single_sku(
+                    sku_splits, store_id, item_id, config, run_dl_models, verbose=False
+                )
+                all_results.append(sku_results)
+
+                pbar.update(1)
 
     # Combine all results
     logger.info("\n" + "=" * 80)
@@ -1888,21 +1924,50 @@ def main_multi_period(
     logger.info(f"\nTotal SKUs loaded: {len(all_sku_splits)}")
     logger.info(f"Total windows to process: {total_windows}")
 
+    # Determine parallel execution strategy
+    use_parallel_skus = not run_dl_models and len(all_sku_splits) > 1
+    n_parallel_skus = min(_NUM_WORKERS, len(all_sku_splits)) if use_parallel_skus else 1
+
+    logger.info(f"Parallel SKU processing: {use_parallel_skus} ({n_parallel_skus} workers)")
+
     # Run multi-period experiment on all SKUs
     all_results = []
 
-    with tqdm(total=len(all_sku_splits), desc="Processing SKUs (multi-period)") as pbar:
-        for (store_id, item_id), sku_splits in all_sku_splits.items():
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing Store {store_id}, Item {item_id} ({len(sku_splits)} windows)")
-            logger.info(f"{'='*60}")
-
-            sku_results = run_multi_period_single_sku(
+    if use_parallel_skus:
+        # Parallel SKU processing for traditional models only
+        def process_sku_mp(args):
+            (store_id, item_id), sku_splits = args
+            return run_multi_period_single_sku(
                 sku_splits, store_id, item_id, config, run_dl_models, verbose=False
             )
-            all_results.append(sku_results)
 
-            pbar.update(1)
+        sku_items = list(all_sku_splits.items())
+
+        with ThreadPoolExecutor(max_workers=n_parallel_skus) as executor:
+            futures = {executor.submit(process_sku_mp, item): item for item in sku_items}
+
+            with tqdm(total=len(futures), desc="Processing SKUs (multi-period, parallel)") as pbar:
+                for future in as_completed(futures):
+                    try:
+                        sku_results = future.result()
+                        all_results.append(sku_results)
+                    except Exception as e:
+                        logger.error(f"Error processing SKU: {e}")
+                    pbar.update(1)
+    else:
+        # Sequential processing
+        with tqdm(total=len(all_sku_splits), desc="Processing SKUs (multi-period)") as pbar:
+            for (store_id, item_id), sku_splits in all_sku_splits.items():
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing Store {store_id}, Item {item_id} ({len(sku_splits)} windows)")
+                logger.info(f"{'='*60}")
+
+                sku_results = run_multi_period_single_sku(
+                    sku_splits, store_id, item_id, config, run_dl_models, verbose=False
+                )
+                all_results.append(sku_results)
+
+                pbar.update(1)
 
     # Combine all results
     logger.info("\n" + "=" * 80)

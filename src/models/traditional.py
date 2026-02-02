@@ -26,10 +26,15 @@ from scipy.optimize import minimize, linprog
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from typing import Optional, List, Tuple, Set
 import logging
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 
 from .base import BaseForecaster, PredictionResult
 
 logger = logging.getLogger(__name__)
+
+# Number of parallel workers
+_NUM_WORKERS = min(multiprocessing.cpu_count(), 8)
 
 
 # =============================================================================
@@ -1080,6 +1085,24 @@ class ExpectedValue(BaseForecaster):
         return PredictionResult(point=point_pred, lower=None, upper=None)
 
 
+def _train_single_rf_model(args):
+    """
+    Train a single RandomForest model - helper for parallel training.
+
+    This function is designed to be used with ThreadPoolExecutor for
+    parallel ensemble training.
+    """
+    X_boot, y_boot, n_estimators, max_depth, random_state = args
+    model = RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+        n_jobs=1  # Use 1 job per model since we're parallelizing at ensemble level
+    )
+    model.fit(X_boot, y_boot)
+    return model
+
+
 class EnsembleBatchPI(BaseForecaster):
     """
     Ensemble Batch Prediction Intervals with Conformalized Quantile Regression (EnbPI+CQR).
@@ -1313,27 +1336,27 @@ class EnsembleBatchPI(BaseForecaster):
         """
         logger.info(f"Training EnbPI+CQR model with {self.n_ensemble} ensemble members...")
 
-        # Phase 1: Train bootstrap ensemble
-        logger.info("Phase 1: Training bootstrap ensemble...")
+        # Phase 1: Train bootstrap ensemble (PARALLELIZED)
+        logger.info("Phase 1: Training bootstrap ensemble (parallel)...")
         bootstrap_data = self._create_bootstrap_samples(
             X_train, y_train, self.n_ensemble
         )
 
-        self.ensemble_models = []
-        self.bootstrap_indices = []
+        # Prepare arguments for parallel training
+        train_args = [
+            (X_boot, y_boot, self.n_estimators, self.max_depth, self.random_state + i)
+            for i, (X_boot, y_boot, indices) in enumerate(bootstrap_data)
+        ]
 
-        for i, (X_boot, y_boot, indices) in enumerate(bootstrap_data):
-            model = RandomForestRegressor(
-                n_estimators=self.n_estimators,
-                max_depth=self.max_depth,
-                random_state=self.random_state + i,  # Different seed for diversity
-                n_jobs=-1
-            )
-            model.fit(X_boot, y_boot)
-            self.ensemble_models.append(model)
-            self.bootstrap_indices.append(set(indices))  # Store as set for fast lookup
+        # Store bootstrap indices
+        self.bootstrap_indices = [set(indices) for _, _, indices in bootstrap_data]
 
-        logger.info(f"  Trained {len(self.ensemble_models)} ensemble members")
+        # Parallel training of ensemble members
+        n_workers = min(_NUM_WORKERS, self.n_ensemble)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            self.ensemble_models = list(executor.map(_train_single_rf_model, train_args))
+
+        logger.info(f"  Trained {len(self.ensemble_models)} ensemble members using {n_workers} workers")
 
         # Compute ensemble predictions on calibration data
         # Use standard ensemble (no LOO) for quantile regression training

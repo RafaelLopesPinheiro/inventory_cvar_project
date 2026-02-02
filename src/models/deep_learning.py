@@ -17,10 +17,107 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from typing import List, Optional, Tuple
 import logging
+import copy
 
 from .base import BaseDeepLearningForecaster, PredictionResult
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# EARLY STOPPING UTILITY
+# =============================================================================
+
+class EarlyStopping:
+    """
+    Early stopping utility to prevent overfitting and reduce training time.
+
+    Monitors a validation metric and stops training when the metric
+    stops improving for a specified number of epochs (patience).
+    """
+
+    def __init__(
+        self,
+        patience: int = 10,
+        min_delta: float = 1e-4,
+        mode: str = 'min',
+        verbose: bool = False
+    ):
+        """
+        Initialize early stopping.
+
+        Parameters
+        ----------
+        patience : int
+            Number of epochs to wait after last improvement.
+        min_delta : float
+            Minimum change to qualify as an improvement.
+        mode : str
+            'min' if lower metric is better, 'max' if higher is better.
+        verbose : bool
+            Whether to print early stopping messages.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.best_epoch = 0
+        self.best_model_state = None
+        self.early_stop = False
+
+        if mode == 'min':
+            self.compare = lambda current, best: current < best - min_delta
+        else:
+            self.compare = lambda current, best: current > best + min_delta
+
+    def __call__(self, score: float, epoch: int, model: nn.Module) -> bool:
+        """
+        Check if training should stop.
+
+        Parameters
+        ----------
+        score : float
+            Current validation score.
+        epoch : int
+            Current epoch number.
+        model : nn.Module
+            Model to save if improvement.
+
+        Returns
+        -------
+        bool
+            True if training should stop, False otherwise.
+        """
+        if self.best_score is None:
+            self.best_score = score
+            self.best_epoch = epoch
+            self.best_model_state = copy.deepcopy(model.state_dict())
+            return False
+
+        if self.compare(score, self.best_score):
+            self.best_score = score
+            self.best_epoch = epoch
+            self.best_model_state = copy.deepcopy(model.state_dict())
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.verbose:
+                logger.info(f"EarlyStopping: {self.counter}/{self.patience}")
+
+        if self.counter >= self.patience:
+            self.early_stop = True
+            if self.verbose:
+                logger.info(f"Early stopping triggered at epoch {epoch}. Best epoch: {self.best_epoch}")
+            return True
+
+        return False
+
+    def restore_best_model(self, model: nn.Module) -> None:
+        """Restore model to best state."""
+        if self.best_model_state is not None:
+            model.load_state_dict(self.best_model_state)
 
 
 # =============================================================================
@@ -241,26 +338,31 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
         X_train: np.ndarray,
         y_train: np.ndarray,
         X_cal: np.ndarray,
-        y_cal: np.ndarray
+        y_cal: np.ndarray,
+        early_stopping_patience: int = 15,
+        min_epochs: int = 20
     ) -> "LSTMQuantileRegression":
-        """Train LSTM and calibrate prediction intervals."""
-        logger.info("Training LSTM Quantile Regression...")
+        """Train LSTM and calibrate prediction intervals with early stopping."""
+        logger.info("Training LSTM Quantile Regression (with early stopping)...")
         logger.info(f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}")
-        
+
         # Set random seed
         torch.manual_seed(self.random_state)
-        
+
         # Normalize features
         X_train_norm = self._normalize(X_train, fit=True)
-        
+        X_cal_norm = self._normalize(X_cal)
+
         # Convert to tensors
         X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
         y_tensor = torch.FloatTensor(y_train).to(self.device)
-        
+        X_cal_tensor = torch.FloatTensor(X_cal_norm).to(self.device)
+        y_cal_tensor = torch.FloatTensor(y_cal).to(self.device)
+
         # Create data loader
         dataset = TensorDataset(X_tensor, y_tensor)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
+
         # Initialize model
         input_size = X_train.shape[2]
         self.model = LSTMQuantileNet(
@@ -270,13 +372,16 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
             dropout=self.dropout,
             quantiles=self.quantiles
         ).to(self.device)
-        
+
         # Loss and optimizer
         criterion = QuantileLoss(self.quantiles)
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-        
-        # Training loop
+
+        # Early stopping
+        early_stopping = EarlyStopping(patience=early_stopping_patience, mode='min')
+
+        # Training loop with early stopping
         self.model.train()
         for epoch in range(self.epochs):
             epoch_loss = 0.0
@@ -288,18 +393,35 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 epoch_loss += loss.item()
-            
+
             avg_loss = epoch_loss / len(dataloader)
             self.training_losses.append(avg_loss)
             scheduler.step(avg_loss)
-            
+
+            # Compute validation loss on calibration set
+            self.model.eval()
+            with torch.no_grad():
+                val_outputs = self.model(X_cal_tensor)
+                val_loss = criterion(val_outputs, y_cal_tensor).item()
+            self.model.train()
+
             if (epoch + 1) % 20 == 0:
-                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
-        
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Train Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+            # Check early stopping (but only after min_epochs)
+            if epoch >= min_epochs:
+                if early_stopping(val_loss, epoch, self.model):
+                    logger.info(f"Early stopping at epoch {epoch + 1}. Best epoch: {early_stopping.best_epoch + 1}")
+                    break
+
+        # Restore best model
+        early_stopping.restore_best_model(self.model)
+        logger.info(f"Training completed. Total epochs: {len(self.training_losses)}")
+
         # Calibration
         logger.info("Applying conformal calibration...")
         self._calibrate(X_cal, y_cal)
-        
+
         self._is_fitted = True
         return self
     
@@ -391,15 +513,17 @@ class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
         X_train: np.ndarray,
         y_train: np.ndarray,
         X_cal: np.ndarray,
-        y_cal: np.ndarray
+        y_cal: np.ndarray,
+        early_stopping_patience: int = 15,
+        min_epochs: int = 20
     ) -> "LSTMQuantileLossOnly":
         """
-        Train LSTM WITHOUT conformal calibration.
+        Train LSTM WITHOUT conformal calibration (with early stopping).
 
-        Note: X_cal and y_cal are included for API consistency but NOT used
-        for calibration in this model.
+        Note: X_cal and y_cal are used for early stopping validation but NOT
+        for conformal calibration in this model.
         """
-        logger.info("Training LSTM Quantile Loss Only (NO calibration)...")
+        logger.info("Training LSTM Quantile Loss Only (NO calibration, with early stopping)...")
         logger.info(f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}")
         logger.info("⚠️  No conformal calibration will be applied")
 
@@ -408,10 +532,13 @@ class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
 
         # Normalize features
         X_train_norm = self._normalize(X_train, fit=True)
+        X_cal_norm = self._normalize(X_cal)
 
         # Convert to tensors
         X_tensor = torch.FloatTensor(X_train_norm).to(self.device)
         y_tensor = torch.FloatTensor(y_train).to(self.device)
+        X_cal_tensor = torch.FloatTensor(X_cal_norm).to(self.device)
+        y_cal_tensor = torch.FloatTensor(y_cal).to(self.device)
 
         # Create data loader
         dataset = TensorDataset(X_tensor, y_tensor)
@@ -432,7 +559,10 @@ class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
-        # Training loop
+        # Early stopping
+        early_stopping = EarlyStopping(patience=early_stopping_patience, mode='min')
+
+        # Training loop with early stopping
         self.model.train()
         for epoch in range(self.epochs):
             epoch_loss = 0.0
@@ -449,8 +579,25 @@ class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
             self.training_losses.append(avg_loss)
             scheduler.step(avg_loss)
 
+            # Compute validation loss for early stopping
+            self.model.eval()
+            with torch.no_grad():
+                val_outputs = self.model(X_cal_tensor)
+                val_loss = criterion(val_outputs, y_cal_tensor).item()
+            self.model.train()
+
             if (epoch + 1) % 20 == 0:
-                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Loss: {avg_loss:.4f}")
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}, Train Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+            # Check early stopping (but only after min_epochs)
+            if epoch >= min_epochs:
+                if early_stopping(val_loss, epoch, self.model):
+                    logger.info(f"Early stopping at epoch {epoch + 1}. Best epoch: {early_stopping.best_epoch + 1}")
+                    break
+
+        # Restore best model
+        early_stopping.restore_best_model(self.model)
+        logger.info(f"Training completed. Total epochs: {len(self.training_losses)}")
 
         # NO CALIBRATION - this is the key difference
         self.calibration_adjustment = 0.0
