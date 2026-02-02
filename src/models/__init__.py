@@ -1,6 +1,11 @@
 """Forecasting models module."""
 
-from .base import BaseForecaster, BaseDeepLearningForecaster, PredictionResult
+from .base import (
+    BaseForecaster,
+    BaseDeepLearningForecaster,
+    PredictionResult,
+    MultiPeriodPredictionResult,
+)
 
 from .traditional import (
     # Naïve baselines
@@ -35,11 +40,18 @@ from .deep_learning import (
     QuantileLoss,
 )
 
+from .multi_period import (
+    MultiPeriodForecaster,
+    MultiPeriodEnsembleForecaster,
+    create_multi_period_forecaster,
+)
+
 __all__ = [
     # Base classes
     "BaseForecaster",
     "BaseDeepLearningForecaster",
     "PredictionResult",
+    "MultiPeriodPredictionResult",
 
     # Traditional models (Simple → Advanced)
     "HistoricalQuantile",       # Naïve baseline
@@ -63,4 +75,9 @@ __all__ = [
     "TemporalFusionTransformer",
     "SPOEndToEnd",
     "QuantileLoss",
+
+    # Multi-period forecasting
+    "MultiPeriodForecaster",
+    "MultiPeriodEnsembleForecaster",
+    "create_multi_period_forecaster",
 ]

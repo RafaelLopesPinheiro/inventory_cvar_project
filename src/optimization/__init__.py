@@ -10,6 +10,12 @@ from .cvar import (
     # DRO optimization
     optimize_wasserstein_dro_single,
     compute_order_quantities_dro,
+    # Multi-period optimization
+    multi_period_newsvendor_loss,
+    optimize_multi_period_cvar_single,
+    compute_order_quantities_multi_period_cvar,
+    MultiPeriodCostMetrics,
+    compute_multi_period_metrics,
 )
 
 __all__ = [
@@ -22,4 +28,10 @@ __all__ = [
     # DRO optimization
     "optimize_wasserstein_dro_single",
     "compute_order_quantities_dro",
+    # Multi-period optimization
+    "multi_period_newsvendor_loss",
+    "optimize_multi_period_cvar_single",
+    "compute_order_quantities_multi_period_cvar",
+    "MultiPeriodCostMetrics",
+    "compute_multi_period_metrics",
 ]

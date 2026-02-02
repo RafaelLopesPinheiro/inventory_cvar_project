@@ -5,6 +5,10 @@ from .loader import (
     TemporalSplits,
     SequenceData,
     RollingWindowSplit,
+    # Multi-period data structures
+    MultiPeriodDataSplit,
+    MultiPeriodRollingWindowSplit,
+    # Data loading functions
     load_raw_data,
     filter_store_item,
     create_time_features,
@@ -19,6 +23,10 @@ from .loader import (
     load_and_prepare_data,
     load_and_prepare_rolling_data,
     load_multi_store_data,
+    # Multi-period data functions
+    create_multi_period_targets,
+    create_multi_period_rolling_window_splits,
+    load_and_prepare_multi_period_rolling_data,
 )
 
 __all__ = [
@@ -26,6 +34,10 @@ __all__ = [
     "TemporalSplits",
     "SequenceData",
     "RollingWindowSplit",
+    # Multi-period data structures
+    "MultiPeriodDataSplit",
+    "MultiPeriodRollingWindowSplit",
+    # Data loading functions
     "load_raw_data",
     "filter_store_item",
     "create_time_features",
@@ -40,4 +52,8 @@ __all__ = [
     "load_and_prepare_data",
     "load_and_prepare_rolling_data",
     "load_multi_store_data",
+    # Multi-period data functions
+    "create_multi_period_targets",
+    "create_multi_period_rolling_window_splits",
+    "load_and_prepare_multi_period_rolling_data",
 ]

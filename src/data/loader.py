@@ -79,6 +79,132 @@ class SequenceData:
     sequence_length: int
 
 
+@dataclass
+class MultiPeriodDataSplit:
+    """
+    Container for multi-period forecasting data.
+
+    This structure supports the "direct" multi-step forecasting strategy,
+    where separate targets are created for each forecast horizon.
+
+    Attributes
+    ----------
+    X : np.ndarray
+        Feature matrix of shape (n_samples, n_features).
+    y_horizons : Dict[int, np.ndarray]
+        Dictionary mapping each horizon to its target array.
+        Keys are horizon values (days ahead), values are target arrays.
+    dates : Optional[np.ndarray]
+        Dates corresponding to each sample (origin dates).
+    horizons : List[int]
+        List of forecast horizons.
+
+    References
+    ----------
+    - Taieb et al. (2012) "A review and comparison of strategies for
+      multi-step ahead time series forecasting"
+    """
+    X: np.ndarray
+    y_horizons: Dict[int, np.ndarray]  # horizon -> target array
+    dates: Optional[np.ndarray] = None
+    horizons: List[int] = None
+
+    def __post_init__(self):
+        if self.horizons is None and self.y_horizons:
+            self.horizons = sorted(self.y_horizons.keys())
+
+    def __len__(self) -> int:
+        if self.y_horizons:
+            return len(next(iter(self.y_horizons.values())))
+        return 0
+
+    def get_target(self, horizon: int) -> np.ndarray:
+        """Get target array for a specific horizon."""
+        if horizon not in self.y_horizons:
+            raise KeyError(f"Horizon {horizon} not found. Available: {self.horizons}")
+        return self.y_horizons[horizon]
+
+
+@dataclass
+class MultiPeriodRollingWindowSplit:
+    """
+    Container for a single rolling window split with multi-period targets.
+
+    Extends RollingWindowSplit to support multiple forecast horizons
+    for each data point.
+
+    Attributes
+    ----------
+    train : MultiPeriodDataSplit
+        Training data with multi-horizon targets.
+    calibration : MultiPeriodDataSplit
+        Calibration data with multi-horizon targets.
+    test : MultiPeriodDataSplit
+        Test data with multi-horizon targets.
+    window_idx : int
+        Index of this window in the rolling sequence.
+    test_start_date : pd.Timestamp
+        Start date of the test period.
+    test_end_date : pd.Timestamp
+        End date of the test period.
+    feature_names : List[str]
+        Names of the features.
+    horizons : List[int]
+        List of forecast horizons.
+    """
+    train: MultiPeriodDataSplit
+    calibration: MultiPeriodDataSplit
+    test: MultiPeriodDataSplit
+    window_idx: int
+    test_start_date: pd.Timestamp
+    test_end_date: pd.Timestamp
+    feature_names: List[str]
+    horizons: List[int]
+
+    def summary(self) -> str:
+        return (
+            f"Window {self.window_idx}: "
+            f"Train={len(self.train)}, Cal={len(self.calibration)}, Test={len(self.test)} | "
+            f"Test period: {self.test_start_date.date()} to {self.test_end_date.date()} | "
+            f"Horizons: {self.horizons}"
+        )
+
+    def to_single_period(self, horizon: int = None) -> RollingWindowSplit:
+        """
+        Convert to single-period RollingWindowSplit for a specific horizon.
+
+        If horizon is None, uses the last (longest) horizon.
+        """
+        if horizon is None:
+            horizon = max(self.horizons)
+
+        train = DataSplit(
+            X=self.train.X,
+            y=self.train.get_target(horizon),
+            dates=self.train.dates
+        )
+        calibration = DataSplit(
+            X=self.calibration.X,
+            y=self.calibration.get_target(horizon),
+            dates=self.calibration.dates
+        )
+        test = DataSplit(
+            X=self.test.X,
+            y=self.test.get_target(horizon),
+            dates=self.test.dates
+        )
+
+        return RollingWindowSplit(
+            train=train,
+            calibration=calibration,
+            test=test,
+            window_idx=self.window_idx,
+            test_start_date=self.test_start_date,
+            test_end_date=self.test_end_date,
+            feature_names=self.feature_names
+        )
+
+
 # =============================================================================
 # DATA LOADING
 # =============================================================================
@@ -791,6 +917,284 @@ def load_and_prepare_rolling_data(
     splits = create_rolling_window_splits(
         df,
         feature_cols,
+        initial_train_days=initial_train_days,
+        calibration_days=calibration_days,
+        test_window_days=test_window_days,
+        step_days=step_days
+    )
+
+    return splits
+
+
+# =============================================================================
+# MULTI-PERIOD FORECASTING DATA PREPARATION
+# =============================================================================
+
+def create_multi_period_targets(
+    y: np.ndarray,
+    horizons: List[int]
+) -> Dict[int, np.ndarray]:
+    """
+    Create multi-period forecast targets for direct forecasting strategy.
+
+    For each sample at time t, creates targets for y[t+h] for each horizon h.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Target time series of shape (n_samples,).
+    horizons : List[int]
+        List of forecast horizons (days ahead to predict).
+
+    Returns
+    -------
+    Dict[int, np.ndarray]
+        Dictionary mapping each horizon to its aligned target array.
+        All arrays have the same length (n_samples - max_horizon).
+
+    Examples
+    --------
+    >>> y = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    >>> targets = create_multi_period_targets(y, horizons=[1, 3])
+    >>> targets[1]  # 1-step ahead: y[1:8] = [2, 3, 4, 5, 6, 7, 8]
+    >>> targets[3]  # 3-step ahead: y[3:10] = [4, 5, 6, 7, 8, 9, 10]
+    """
+    max_horizon = max(horizons)
+    n_valid = len(y) - max_horizon
+
+    targets = {}
+    for h in horizons:
+        # For each origin t (from 0 to n_valid-1), target is y[t + h]
+        targets[h] = y[h:h + n_valid]
+
+    return targets
+
+
+def create_multi_period_rolling_window_splits(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    horizons: List[int] = [1, 7, 14, 21, 28],
+    initial_train_days: int = 730,  # 2 years
+    calibration_days: int = 365,     # 1 year
+    test_window_days: int = 28,      # Align with max horizon
+    step_days: int = 28              # Roll forward by 1 planning period
+) -> List[MultiPeriodRollingWindowSplit]:
+    """
+    Create rolling window splits with multi-period forecast targets.
+
+    This function creates expanding window splits where each sample has
+    multiple forecast targets corresponding to different horizons (h=1, 7, 14, ...).
+    This enables robust evaluation across multiple forecast horizons and
+    supports multi-period optimization.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Processed dataframe with features and date column.
+    feature_cols : List[str]
+        List of feature column names.
+    horizons : List[int]
+        List of forecast horizons (days ahead) to predict.
+        Default: [1, 7, 14, 21, 28] for daily, weekly, bi-weekly, 3-weekly, monthly.
+    initial_train_days : int
+        Number of days in initial training period (default 730 = 2 years).
+    calibration_days : int
+        Number of days for calibration period (default 365 = 1 year).
+    test_window_days : int
+        Number of days in test period (default 28 = 4 weeks, aligned with max horizon).
+    step_days : int
+        Number of days to roll forward for each window (default 28 = 4 weeks).
+
+    Returns
+    -------
+    List[MultiPeriodRollingWindowSplit]
+        List of rolling window splits with multi-horizon targets.
+
+    Notes
+    -----
+    The test_window_days should ideally be >= max(horizons) to ensure we have
+    enough data points for meaningful evaluation at all horizons.
+
+    For a given window:
+    - Train: Days [start, train_end) - used to fit the model
+    - Calibration: Days [train_end, cal_end) - used for conformal calibration
+    - Test: Days [cal_end, test_end) - used for evaluation
+
+    Each sample in train/cal/test has targets for ALL horizons, so we need
+    to truncate appropriately based on max_horizon.
+
+    References
+    ----------
+    - Taieb et al. (2012) "A review and comparison of strategies for
+      multi-step ahead time series forecasting"
+    - Hyndman & Athanasopoulos (2021) "Forecasting: Principles and Practice"
+    """
+    logger.info("Creating multi-period rolling window splits...")
+    logger.info(f"  Horizons: {horizons}")
+    logger.info(f"  Initial train: {initial_train_days} days")
+    logger.info(f"  Calibration: {calibration_days} days")
+    logger.info(f"  Test window: {test_window_days} days")
+    logger.info(f"  Step size: {step_days} days")
+
+    max_horizon = max(horizons)
+
+    # Ensure data is sorted by date
+    df = df.sort_values('date').reset_index(drop=True)
+
+    splits = []
+    window_idx = 0
+
+    # Start position for first window
+    start_pos = 0
+
+    while True:
+        # Calculate split positions
+        # We need extra max_horizon days at the end to compute all horizon targets
+        train_end = start_pos + initial_train_days
+        cal_end = train_end + calibration_days
+        test_end = cal_end + test_window_days
+
+        # Check if we have enough data (need max_horizon extra for targets)
+        if test_end + max_horizon > len(df):
+            break
+
+        # Extract data for this window (including extra for horizon targets)
+        # For the features (X), we use the origin dates
+        # For the targets (y), we shift by horizon
+
+        # Training data
+        train_X = df.iloc[start_pos:train_end - max_horizon][feature_cols].values
+        train_y_full = df.iloc[start_pos:train_end]['sales'].values
+        train_y_horizons = create_multi_period_targets(train_y_full, horizons)
+        train_dates = df.iloc[start_pos:train_end - max_horizon]['date'].values
+
+        train_split = MultiPeriodDataSplit(
+            X=train_X,
+            y_horizons=train_y_horizons,
+            dates=train_dates,
+            horizons=horizons
+        )
+
+        # Calibration data
+        cal_X = df.iloc[train_end:cal_end - max_horizon][feature_cols].values
+        cal_y_full = df.iloc[train_end:cal_end]['sales'].values
+        cal_y_horizons = create_multi_period_targets(cal_y_full, horizons)
+        cal_dates = df.iloc[train_end:cal_end - max_horizon]['date'].values
+
+        cal_split = MultiPeriodDataSplit(
+            X=cal_X,
+            y_horizons=cal_y_horizons,
+            dates=cal_dates,
+            horizons=horizons
+        )
+
+        # Test data
+        test_X = df.iloc[cal_end:test_end][feature_cols].values
+        test_y_full = df.iloc[cal_end:test_end + max_horizon]['sales'].values
+        test_y_horizons = create_multi_period_targets(test_y_full, horizons)
+        test_dates = df.iloc[cal_end:test_end]['date'].values
+
+        # Truncate test to have consistent length with targets
+        n_test_valid = len(test_y_horizons[horizons[0]])
+        test_X = test_X[:n_test_valid]
+        test_dates = test_dates[:n_test_valid]
+
+        test_split = MultiPeriodDataSplit(
+            X=test_X,
+            y_horizons=test_y_horizons,
+            dates=test_dates,
+            horizons=horizons
+        )
+
+        # Get test period dates for metadata
+        test_start_date = df.iloc[cal_end]['date']
+        test_end_date = df.iloc[min(test_end - 1, len(df) - 1)]['date']
+
+        # Create multi-period rolling window split
+        mp_split = MultiPeriodRollingWindowSplit(
+            train=train_split,
+            calibration=cal_split,
+            test=test_split,
+            window_idx=window_idx,
+            test_start_date=test_start_date,
+            test_end_date=test_end_date,
+            feature_names=feature_cols,
+            horizons=horizons
+        )
+
+        splits.append(mp_split)
+        logger.info(f"  {mp_split.summary()}")
+
+        # Move to next window
+        start_pos += step_days
+        window_idx += 1
+
+    logger.info(f"Created {len(splits)} multi-period rolling window splits")
+
+    return splits
+
+
+def load_and_prepare_multi_period_rolling_data(
+    filepath: str,
+    store_id: int = 1,
+    item_id: int = 1,
+    horizons: List[int] = [1, 7, 14, 21, 28],
+    lag_periods: List[int] = [1, 7, 28],
+    rolling_windows: List[int] = [7, 28],
+    initial_train_days: int = 730,
+    calibration_days: int = 365,
+    test_window_days: int = 28,
+    step_days: int = 28
+) -> List[MultiPeriodRollingWindowSplit]:
+    """
+    Convenience function to load and prepare multi-period rolling window data.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the CSV file.
+    store_id : int
+        Store ID to filter.
+    item_id : int
+        Item ID to filter.
+    horizons : List[int]
+        List of forecast horizons (days ahead).
+    lag_periods : List[int]
+        Lag periods for features.
+    rolling_windows : List[int]
+        Rolling window sizes.
+    initial_train_days : int
+        Initial training period in days.
+    calibration_days : int
+        Calibration period in days.
+    test_window_days : int
+        Test window size in days.
+    step_days : int
+        Step size for rolling windows.
+
+    Returns
+    -------
+    List[MultiPeriodRollingWindowSplit]
+        List of multi-period rolling window splits.
+    """
+    # Load raw data
+    df = load_raw_data(filepath)
+
+    # Filter for specific store/item
+    df = filter_store_item(df, store_id, item_id)
+
+    # Create features
+    df, feature_cols = create_all_features(
+        df,
+        lag_periods=lag_periods,
+        rolling_windows=rolling_windows
+    )
+
+    # Create multi-period rolling window splits
+    splits = create_multi_period_rolling_window_splits(
+        df,
+        feature_cols,
+        horizons=horizons,
         initial_train_days=initial_train_days,
         calibration_days=calibration_days,
         test_window_days=test_window_days,

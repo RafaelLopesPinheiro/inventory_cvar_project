@@ -16,21 +16,223 @@ class PredictionResult:
     point: np.ndarray  # Point predictions
     lower: Optional[np.ndarray] = None  # Lower bound of prediction interval
     upper: Optional[np.ndarray] = None  # Upper bound of prediction interval
-    
+
     @property
     def has_intervals(self) -> bool:
         """Check if prediction intervals are available."""
         return self.lower is not None and self.upper is not None
-    
+
     @property
     def interval_width(self) -> Optional[np.ndarray]:
         """Compute prediction interval width."""
         if self.has_intervals:
             return self.upper - self.lower
         return None
-    
+
     def __len__(self) -> int:
         return len(self.point)
+
+
+@dataclass
+class MultiPeriodPredictionResult:
+    """
+    Container for multi-period (multi-horizon) forecasting predictions.
+
+    This structure supports predicting multiple future horizons simultaneously,
+    which enables more robust scientific evaluation and joint optimization.
+
+    Attributes
+    ----------
+    horizons : List[int]
+        List of forecast horizons (days ahead) that were predicted.
+        Example: [1, 7, 14, 21, 28] for 1-day, 1-week, 2-week, 3-week, 4-week ahead.
+    predictions : Dict[int, PredictionResult]
+        Dictionary mapping each horizon to its PredictionResult.
+        Keys are horizon values (e.g., 1, 7, 14, 21, 28).
+
+    Examples
+    --------
+    >>> mp_result = MultiPeriodPredictionResult(
+    ...     horizons=[1, 7, 14],
+    ...     predictions={
+    ...         1: PredictionResult(point=..., lower=..., upper=...),
+    ...         7: PredictionResult(point=..., lower=..., upper=...),
+    ...         14: PredictionResult(point=..., lower=..., upper=...),
+    ...     }
+    ... )
+    >>> mp_result.get_horizon(7)  # Get 7-day ahead predictions
+    PredictionResult(...)
+    >>> mp_result.aggregate_point('mean')  # Mean across all horizons
+    array([...])
+
+    References
+    ----------
+    - Taieb et al. (2012) "A review and comparison of strategies for multi-step ahead
+      time series forecasting based on NN5 competition"
+    - Hyndman & Athanasopoulos (2021) "Forecasting: Principles and Practice" Ch. 13
+    """
+    horizons: List[int]  # List of forecast horizons (days ahead)
+    predictions: Dict[int, PredictionResult]  # horizon -> PredictionResult
+
+    def get_horizon(self, horizon: int) -> PredictionResult:
+        """
+        Get predictions for a specific horizon.
+
+        Parameters
+        ----------
+        horizon : int
+            The forecast horizon to retrieve.
+
+        Returns
+        -------
+        PredictionResult
+            Predictions for the specified horizon.
+
+        Raises
+        ------
+        KeyError
+            If the horizon is not in the predictions.
+        """
+        if horizon not in self.predictions:
+            raise KeyError(f"Horizon {horizon} not found. Available: {self.horizons}")
+        return self.predictions[horizon]
+
+    @property
+    def n_horizons(self) -> int:
+        """Number of horizons in the multi-period prediction."""
+        return len(self.horizons)
+
+    @property
+    def n_samples(self) -> int:
+        """Number of samples (time points) predicted."""
+        if self.horizons:
+            return len(self.predictions[self.horizons[0]])
+        return 0
+
+    def aggregate_point(self, method: str = "mean") -> np.ndarray:
+        """
+        Aggregate point predictions across all horizons.
+
+        Parameters
+        ----------
+        method : str
+            Aggregation method: "mean", "median", "max", "min", "sum".
+
+        Returns
+        -------
+        np.ndarray
+            Aggregated point predictions with shape (n_samples,).
+        """
+        points = np.array([self.predictions[h].point for h in self.horizons])
+        # Shape: (n_horizons, n_samples)
+
+        if method == "mean":
+            return np.mean(points, axis=0)
+        elif method == "median":
+            return np.median(points, axis=0)
+        elif method == "max":
+            return np.max(points, axis=0)
+        elif method == "min":
+            return np.min(points, axis=0)
+        elif method == "sum":
+            return np.sum(points, axis=0)
+        else:
+            raise ValueError(f"Unknown aggregation method: {method}")
+
+    def aggregate_intervals(
+        self, method: str = "union"
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Aggregate prediction intervals across all horizons.
+
+        Parameters
+        ----------
+        method : str
+            Aggregation method:
+            - "union": Take widest interval (min lower, max upper)
+            - "intersection": Take narrowest interval (max lower, min upper)
+            - "mean": Average the bounds
+
+        Returns
+        -------
+        Tuple[Optional[np.ndarray], Optional[np.ndarray]]
+            Aggregated (lower, upper) bounds with shape (n_samples,).
+        """
+        lowers = []
+        uppers = []
+
+        for h in self.horizons:
+            pred = self.predictions[h]
+            if pred.has_intervals:
+                lowers.append(pred.lower)
+                uppers.append(pred.upper)
+
+        if not lowers:
+            return None, None
+
+        lowers = np.array(lowers)  # (n_horizons, n_samples)
+        uppers = np.array(uppers)
+
+        if method == "union":
+            return np.min(lowers, axis=0), np.max(uppers, axis=0)
+        elif method == "intersection":
+            return np.max(lowers, axis=0), np.min(uppers, axis=0)
+        elif method == "mean":
+            return np.mean(lowers, axis=0), np.mean(uppers, axis=0)
+        else:
+            raise ValueError(f"Unknown aggregation method: {method}")
+
+    def to_single_period(self, aggregation: str = "mean") -> PredictionResult:
+        """
+        Convert multi-period predictions to a single PredictionResult.
+
+        This is useful for backward compatibility with single-period methods.
+
+        Parameters
+        ----------
+        aggregation : str
+            Method for aggregating predictions across horizons.
+
+        Returns
+        -------
+        PredictionResult
+            Single aggregated prediction result.
+        """
+        point = self.aggregate_point(aggregation)
+        lower, upper = self.aggregate_intervals("union")
+        return PredictionResult(point=point, lower=lower, upper=upper)
+
+    def get_point_matrix(self) -> np.ndarray:
+        """
+        Get point predictions as a matrix.
+
+        Returns
+        -------
+        np.ndarray
+            Matrix of shape (n_samples, n_horizons) with point predictions.
+        """
+        return np.array([self.predictions[h].point for h in self.horizons]).T
+
+    def get_interval_matrices(
+        self,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Get prediction intervals as matrices.
+
+        Returns
+        -------
+        Tuple[Optional[np.ndarray], Optional[np.ndarray]]
+            Lower and upper bound matrices of shape (n_samples, n_horizons).
+        """
+        if not all(self.predictions[h].has_intervals for h in self.horizons):
+            return None, None
+
+        lower = np.array([self.predictions[h].lower for h in self.horizons]).T
+        upper = np.array([self.predictions[h].upper for h in self.horizons]).T
+        return lower, upper
+
+    def __len__(self) -> int:
+        return self.n_samples
 
 
 class BaseForecaster(ABC):

@@ -180,6 +180,55 @@ class RollingWindowConfig:
 
 
 # =============================================================================
+# MULTI-PERIOD CONFIGURATION
+# =============================================================================
+
+@dataclass
+class MultiPeriodConfig:
+    """
+    Multi-period forecasting configuration for robust scientific evaluation.
+
+    Instead of predicting a single point at horizon H, multi-period forecasting
+    predicts demand for each of the next H periods (t+1, t+2, ..., t+H).
+    This enables:
+    1. More robust evaluation across multiple horizons
+    2. Joint optimization over the planning horizon
+    3. Better uncertainty quantification across time
+
+    References:
+    -----------
+    - Hyndman & Athanasopoulos (2021) "Forecasting: Principles and Practice" Ch. 13
+    - Taieb et al. (2012) "A review and comparison of strategies for multi-step ahead time series forecasting"
+    """
+    enabled: bool = True  # Enable multi-period mode
+
+    # Forecasting horizons
+    forecast_horizons: List[int] = field(default_factory=lambda: [1, 7, 14, 21, 28])
+    # List of forecast horizons to predict (days ahead)
+    # Default: day 1, week 1, week 2, week 3, week 4
+
+    # Planning horizon for joint optimization
+    planning_horizon: int = 28  # Total planning period (days)
+
+    # Aggregation method for multi-period results
+    aggregation: str = "mean"  # Options: "mean", "worst_case", "weighted"
+
+    # Weights for weighted aggregation (if aggregation="weighted")
+    horizon_weights: Optional[List[float]] = None
+    # If None, uses equal weights; can specify to weight near-term more heavily
+
+    # Multi-period optimization settings
+    joint_optimization: bool = True  # Optimize jointly vs. independently per horizon
+    correlation_aware: bool = True  # Account for demand correlations across periods
+
+    # Forecasting strategy
+    strategy: str = "direct"  # Options: "direct", "recursive", "mimo"
+    # direct: Train separate model for each horizon (most common)
+    # recursive: Iteratively predict using previous predictions as input
+    # mimo: Multi-input multi-output (single model predicts all horizons)
+
+
+# =============================================================================
 # OPTIMIZATION CONFIGURATION
 # =============================================================================
 
@@ -203,6 +252,7 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     cvar: CVaRConfig = field(default_factory=CVaRConfig)
     rolling_window: RollingWindowConfig = field(default_factory=RollingWindowConfig)
+    multi_period: MultiPeriodConfig = field(default_factory=MultiPeriodConfig)
 
     # Model configs
     conformal: ConformalConfig = field(default_factory=ConformalConfig)
