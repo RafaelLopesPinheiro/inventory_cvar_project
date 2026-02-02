@@ -436,7 +436,7 @@ def compute_expected_cost(
 ) -> Tuple[float, float, float]:
     """
     Compute expected cost and CVaR metrics.
-    
+
     Parameters
     ----------
     order_quantities : np.ndarray
@@ -445,7 +445,7 @@ def compute_expected_cost(
         Actual demand for each period.
     ordering_cost, holding_cost, stockout_cost : float
         Cost parameters.
-        
+
     Returns
     -------
     Tuple[float, float, float]
@@ -455,16 +455,406 @@ def compute_expected_cost(
         order_quantities, demand_samples,
         ordering_cost, holding_cost, stockout_cost
     )
-    
+
     mean_cost = np.mean(costs)
-    
+
     # CVaR computation
     sorted_costs = np.sort(costs)
     n = len(costs)
     cvar_90_idx = int(np.ceil(0.90 * n))
     cvar_95_idx = int(np.ceil(0.95 * n))
-    
+
     cvar_90 = np.mean(sorted_costs[cvar_90_idx:])
     cvar_95 = np.mean(sorted_costs[cvar_95_idx:])
-    
+
     return mean_cost, cvar_90, cvar_95
+
+
+# =============================================================================
+# MULTI-PERIOD CVaR OPTIMIZATION
+# =============================================================================
+
+from typing import Dict, List
+
+
+def multi_period_newsvendor_loss(
+    q: np.ndarray,
+    d: Dict[int, np.ndarray],
+    horizons: List[int],
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    aggregation: str = "mean"
+) -> np.ndarray:
+    """
+    Compute multi-period newsvendor loss aggregated across horizons.
+
+    For each sample, computes the loss at each horizon and then aggregates
+    using the specified method.
+
+    Parameters
+    ----------
+    q : np.ndarray
+        Order quantities of shape (n_samples,) or (n_samples, n_horizons).
+    d : Dict[int, np.ndarray]
+        Actual demand for each horizon. Keys are horizons, values are
+        demand arrays of shape (n_scenarios,) for a single sample or
+        (n_samples,) for multiple samples.
+    horizons : List[int]
+        List of forecast horizons.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    aggregation : str
+        How to aggregate across horizons: "mean", "sum", "worst_case".
+
+    Returns
+    -------
+    np.ndarray
+        Aggregated loss values.
+    """
+    horizon_losses = []
+
+    for h in horizons:
+        if q.ndim == 1:
+            # Same order quantity for all horizons
+            q_h = q
+        else:
+            # Different order quantity per horizon
+            h_idx = horizons.index(h)
+            q_h = q[:, h_idx]
+
+        d_h = d[h]
+        loss_h = newsvendor_loss(q_h, d_h, ordering_cost, holding_cost, stockout_cost)
+        horizon_losses.append(loss_h)
+
+    horizon_losses = np.array(horizon_losses)  # (n_horizons, n_samples) or (n_horizons, n_scenarios)
+
+    if aggregation == "mean":
+        return np.mean(horizon_losses, axis=0)
+    elif aggregation == "sum":
+        return np.sum(horizon_losses, axis=0)
+    elif aggregation == "worst_case":
+        return np.max(horizon_losses, axis=0)
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+
+
+def optimize_multi_period_cvar_single(
+    demand_samples: Dict[int, np.ndarray],
+    horizons: List[int],
+    beta: float = 0.90,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    aggregation: str = "mean",
+    joint_optimization: bool = True
+) -> np.ndarray:
+    """
+    Optimize order quantities using multi-period CVaR.
+
+    For a single forecast origin, optimizes order quantities to minimize
+    the CVaR of aggregated loss across multiple forecast horizons.
+
+    Parameters
+    ----------
+    demand_samples : Dict[int, np.ndarray]
+        Dictionary mapping each horizon to its demand samples.
+        Each array has shape (n_scenarios,).
+    horizons : List[int]
+        List of forecast horizons.
+    beta : float
+        CVaR level (tail probability).
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    aggregation : str
+        How to aggregate losses: "mean", "sum", "worst_case".
+    joint_optimization : bool
+        If True, optimizes a single order quantity for all horizons.
+        If False, optimizes separately for each horizon.
+
+    Returns
+    -------
+    np.ndarray
+        Optimal order quantities. If joint_optimization=True, returns scalar.
+        Otherwise returns array of shape (n_horizons,).
+    """
+    n_scenarios = len(demand_samples[horizons[0]])
+
+    if joint_optimization:
+        # Optimize single order quantity for all horizons
+        def cvar_objective(x: np.ndarray) -> float:
+            q, tau = x
+            q_arr = np.full(n_scenarios, q)
+
+            # Create demand dict with repeated values for vectorization
+            d_scenarios = {h: demand_samples[h] for h in horizons}
+
+            losses = multi_period_newsvendor_loss(
+                q_arr, d_scenarios, horizons,
+                ordering_cost, holding_cost, stockout_cost,
+                aggregation
+            )
+
+            cvar_term = tau + (1 / (n_scenarios * (1 - beta))) * np.sum(
+                np.maximum(0, losses - tau)
+            )
+            return cvar_term
+
+        # Initial guess based on mean demand across horizons
+        mean_demands = [np.mean(demand_samples[h]) for h in horizons]
+        q0 = np.mean(mean_demands)
+        tau0 = 0.0
+
+        bounds = [(0, None), (None, None)]
+
+        result = minimize(
+            cvar_objective,
+            [q0, tau0],
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+
+        return max(0, result.x[0])
+
+    else:
+        # Optimize separately for each horizon
+        optimal_quantities = []
+
+        for h in horizons:
+            q_opt = optimize_cvar_single(
+                demand_samples[h], beta,
+                ordering_cost, holding_cost, stockout_cost
+            )
+            optimal_quantities.append(q_opt)
+
+        return np.array(optimal_quantities)
+
+
+def compute_order_quantities_multi_period_cvar(
+    point_pred: Dict[int, np.ndarray],
+    lower: Dict[int, np.ndarray],
+    upper: Dict[int, np.ndarray],
+    horizons: List[int],
+    beta: float = 0.90,
+    n_samples: int = 1000,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    aggregation: str = "mean",
+    joint_optimization: bool = True,
+    random_seed: int = 42,
+    verbose: bool = True
+) -> Dict[int, np.ndarray]:
+    """
+    Compute CVaR-optimal order quantities for multi-period predictions.
+
+    For each forecast origin, samples demand scenarios from prediction
+    intervals at each horizon, then optimizes considering all horizons jointly.
+
+    Parameters
+    ----------
+    point_pred : Dict[int, np.ndarray]
+        Point predictions for each horizon.
+    lower : Dict[int, np.ndarray]
+        Lower bounds of prediction intervals for each horizon.
+    upper : Dict[int, np.ndarray]
+        Upper bounds of prediction intervals for each horizon.
+    horizons : List[int]
+        List of forecast horizons.
+    beta : float
+        CVaR level.
+    n_samples : int
+        Number of demand scenarios to generate per horizon.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    aggregation : str
+        How to aggregate losses across horizons.
+    joint_optimization : bool
+        Whether to optimize jointly or separately per horizon.
+    random_seed : int
+        Random seed for reproducibility.
+    verbose : bool
+        Whether to print progress.
+
+    Returns
+    -------
+    Dict[int, np.ndarray]
+        Optimal order quantities for each horizon.
+        If joint_optimization=True, all horizons get the same quantities.
+    """
+    if verbose:
+        logger.info(f"Optimizing multi-period CVaR (beta={beta}) for {len(point_pred[horizons[0]])} days...")
+        logger.info(f"  Horizons: {horizons}")
+        logger.info(f"  Aggregation: {aggregation}")
+        logger.info(f"  Joint optimization: {joint_optimization}")
+
+    rng = np.random.RandomState(random_seed)
+    n_days = len(point_pred[horizons[0]])
+
+    if joint_optimization:
+        # Single order quantity for each day (same across horizons)
+        joint_orders = []
+
+        for i in range(n_days):
+            if verbose and (i + 1) % 50 == 0:
+                logger.info(f"Processed {i + 1}/{n_days} days...")
+
+            # Sample demand scenarios for each horizon
+            demand_scenarios = {}
+            for h in horizons:
+                demand_scenarios[h] = rng.uniform(lower[h][i], upper[h][i], n_samples)
+
+            # Optimize jointly
+            q_opt = optimize_multi_period_cvar_single(
+                demand_scenarios, horizons, beta,
+                ordering_cost, holding_cost, stockout_cost,
+                aggregation, joint_optimization=True
+            )
+            joint_orders.append(q_opt)
+
+        # Return same quantities for all horizons
+        joint_orders = np.array(joint_orders)
+        return {h: joint_orders for h in horizons}
+
+    else:
+        # Optimize separately for each horizon
+        horizon_orders = {h: [] for h in horizons}
+
+        for i in range(n_days):
+            if verbose and (i + 1) % 50 == 0:
+                logger.info(f"Processed {i + 1}/{n_days} days...")
+
+            # Sample demand scenarios for each horizon
+            demand_scenarios = {}
+            for h in horizons:
+                demand_scenarios[h] = rng.uniform(lower[h][i], upper[h][i], n_samples)
+
+            # Optimize for each horizon
+            for h in horizons:
+                q_opt = optimize_cvar_single(
+                    demand_scenarios[h], beta,
+                    ordering_cost, holding_cost, stockout_cost
+                )
+                horizon_orders[h].append(q_opt)
+
+        return {h: np.array(horizon_orders[h]) for h in horizons}
+
+
+@dataclass
+class MultiPeriodCostMetrics:
+    """Container for multi-period cost metrics."""
+    # Per-horizon metrics
+    horizon_mean_costs: Dict[int, float]
+    horizon_cvar_90: Dict[int, float]
+    horizon_cvar_95: Dict[int, float]
+    horizon_service_levels: Dict[int, float]
+
+    # Aggregated metrics
+    aggregated_mean_cost: float
+    aggregated_cvar_90: float
+    aggregated_cvar_95: float
+    aggregated_service_level: float
+
+    # Horizon list for reference
+    horizons: List[int]
+
+
+def compute_multi_period_metrics(
+    order_quantities: Dict[int, np.ndarray],
+    actual_demand: Dict[int, np.ndarray],
+    horizons: List[int],
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    aggregation: str = "mean"
+) -> MultiPeriodCostMetrics:
+    """
+    Compute cost metrics for multi-period forecasts.
+
+    Calculates metrics both per-horizon and aggregated across all horizons.
+
+    Parameters
+    ----------
+    order_quantities : Dict[int, np.ndarray]
+        Order quantities for each horizon.
+    actual_demand : Dict[int, np.ndarray]
+        Actual demand for each horizon.
+    horizons : List[int]
+        List of forecast horizons.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    aggregation : str
+        How to aggregate across horizons for overall metrics.
+
+    Returns
+    -------
+    MultiPeriodCostMetrics
+        Container with all computed metrics.
+    """
+    # Per-horizon metrics
+    horizon_mean_costs = {}
+    horizon_cvar_90 = {}
+    horizon_cvar_95 = {}
+    horizon_service_levels = {}
+
+    all_costs = []
+
+    for h in horizons:
+        costs = newsvendor_loss(
+            order_quantities[h], actual_demand[h],
+            ordering_cost, holding_cost, stockout_cost
+        )
+        all_costs.append(costs)
+
+        # Mean cost
+        horizon_mean_costs[h] = np.mean(costs)
+
+        # CVaR metrics
+        sorted_costs = np.sort(costs)
+        n = len(costs)
+        cvar_90_idx = int(np.ceil(0.90 * n))
+        cvar_95_idx = int(np.ceil(0.95 * n))
+
+        horizon_cvar_90[h] = np.mean(sorted_costs[cvar_90_idx:])
+        horizon_cvar_95[h] = np.mean(sorted_costs[cvar_95_idx:])
+
+        # Service level (fill rate)
+        service_level = np.mean(order_quantities[h] >= actual_demand[h])
+        horizon_service_levels[h] = service_level
+
+    # Aggregated metrics
+    all_costs = np.array(all_costs)  # (n_horizons, n_samples)
+
+    if aggregation == "mean":
+        aggregated_costs = np.mean(all_costs, axis=0)
+    elif aggregation == "sum":
+        aggregated_costs = np.sum(all_costs, axis=0)
+    elif aggregation == "worst_case":
+        aggregated_costs = np.max(all_costs, axis=0)
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+
+    aggregated_mean_cost = np.mean(aggregated_costs)
+
+    sorted_agg_costs = np.sort(aggregated_costs)
+    n = len(aggregated_costs)
+    cvar_90_idx = int(np.ceil(0.90 * n))
+    cvar_95_idx = int(np.ceil(0.95 * n))
+
+    aggregated_cvar_90 = np.mean(sorted_agg_costs[cvar_90_idx:])
+    aggregated_cvar_95 = np.mean(sorted_agg_costs[cvar_95_idx:])
+
+    # Aggregated service level (average across horizons)
+    aggregated_service_level = np.mean(list(horizon_service_levels.values()))
+
+    return MultiPeriodCostMetrics(
+        horizon_mean_costs=horizon_mean_costs,
+        horizon_cvar_90=horizon_cvar_90,
+        horizon_cvar_95=horizon_cvar_95,
+        horizon_service_levels=horizon_service_levels,
+        aggregated_mean_cost=aggregated_mean_cost,
+        aggregated_cvar_90=aggregated_cvar_90,
+        aggregated_cvar_95=aggregated_cvar_95,
+        aggregated_service_level=aggregated_service_level,
+        horizons=horizons
+    )
