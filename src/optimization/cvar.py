@@ -16,8 +16,14 @@ from scipy.optimize import minimize
 from typing import Tuple, Optional
 from dataclasses import dataclass
 import logging
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing
+import os
 
 logger = logging.getLogger(__name__)
+
+# Determine optimal number of workers
+_NUM_WORKERS = min(multiprocessing.cpu_count(), 8)
 
 
 @dataclass
@@ -126,6 +132,18 @@ def optimize_cvar_single(
     return max(0, result.x[0])
 
 
+def _optimize_cvar_single_worker(args):
+    """
+    Worker function for parallel CVaR optimization.
+
+    This function is designed to be pickle-able for multiprocessing.
+    """
+    lower_i, upper_i, n_samples, seed, beta, ordering_cost, holding_cost, stockout_cost = args
+    rng = np.random.RandomState(seed)
+    demand_samples = rng.uniform(lower_i, upper_i, n_samples)
+    return optimize_cvar_single(demand_samples, beta, ordering_cost, holding_cost, stockout_cost)
+
+
 def compute_order_quantities_cvar(
     point_pred: np.ndarray,
     lower: np.ndarray,
@@ -136,14 +154,16 @@ def compute_order_quantities_cvar(
     holding_cost: float = 2.0,
     stockout_cost: float = 50.0,
     random_seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    parallel: bool = True,
+    n_jobs: int = -1
 ) -> np.ndarray:
     """
     Compute CVaR-optimal order quantities for all predictions.
-    
+
     Samples demand scenarios uniformly from prediction intervals and
-    optimizes CVaR for each day.
-    
+    optimizes CVaR for each day. Uses parallel processing for speedup.
+
     Parameters
     ----------
     point_pred : np.ndarray
@@ -162,32 +182,57 @@ def compute_order_quantities_cvar(
         Random seed for reproducibility.
     verbose : bool
         Whether to print progress.
-        
+    parallel : bool
+        Whether to use parallel processing. Default True for speedup.
+    n_jobs : int
+        Number of parallel jobs. -1 uses all available cores.
+
     Returns
     -------
     np.ndarray
         Optimal order quantities.
     """
+    n_days = len(point_pred)
+
     if verbose:
-        logger.info(f"Optimizing CVaR (beta={beta}) for {len(point_pred)} days...")
-    
-    rng = np.random.RandomState(random_seed)
-    order_quantities = []
-    
-    for i in range(len(point_pred)):
-        if verbose and (i + 1) % 50 == 0:
-            logger.info(f"Processed {i + 1}/{len(point_pred)} days...")
-        
-        # Sample demand scenarios from prediction interval
-        demand_samples = rng.uniform(lower[i], upper[i], n_samples)
-        
-        # Optimize CVaR
-        q_opt = optimize_cvar_single(
-            demand_samples, beta,
-            ordering_cost, holding_cost, stockout_cost
-        )
-        order_quantities.append(q_opt)
-    
+        logger.info(f"Optimizing CVaR (beta={beta}) for {n_days} days...")
+
+    # Determine number of workers
+    if n_jobs == -1:
+        n_workers = _NUM_WORKERS
+    else:
+        n_workers = min(n_jobs, _NUM_WORKERS)
+
+    # For small number of days, sequential is faster (avoid overhead)
+    if not parallel or n_days < 10:
+        rng = np.random.RandomState(random_seed)
+        order_quantities = []
+
+        for i in range(n_days):
+            demand_samples = rng.uniform(lower[i], upper[i], n_samples)
+            q_opt = optimize_cvar_single(
+                demand_samples, beta,
+                ordering_cost, holding_cost, stockout_cost
+            )
+            order_quantities.append(q_opt)
+
+        return np.array(order_quantities)
+
+    # Parallel processing for larger problems
+    # Prepare arguments for each day with unique seeds
+    args_list = [
+        (lower[i], upper[i], n_samples, random_seed + i, beta,
+         ordering_cost, holding_cost, stockout_cost)
+        for i in range(n_days)
+    ]
+
+    # Use ThreadPoolExecutor (faster for I/O bound scipy.optimize)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        order_quantities = list(executor.map(_optimize_cvar_single_worker, args_list))
+
+    if verbose:
+        logger.info(f"Completed CVaR optimization for {n_days} days using {n_workers} workers")
+
     return np.array(order_quantities)
 
 
@@ -359,6 +404,18 @@ def optimize_wasserstein_dro_single(
     return max(0, result.x[0])
 
 
+def _optimize_dro_single_worker(args):
+    """
+    Worker function for parallel DRO optimization.
+
+    This function is designed to be pickle-able for multiprocessing.
+    """
+    lower_i, upper_i, n_samples, seed, epsilon, beta, ordering_cost, holding_cost, stockout_cost = args
+    rng = np.random.RandomState(seed)
+    demand_samples = rng.uniform(lower_i, upper_i, n_samples)
+    return optimize_wasserstein_dro_single(demand_samples, epsilon, beta, ordering_cost, holding_cost, stockout_cost)
+
+
 def compute_order_quantities_dro(
     point_pred: np.ndarray,
     lower: np.ndarray,
@@ -370,13 +427,16 @@ def compute_order_quantities_dro(
     holding_cost: float = 2.0,
     stockout_cost: float = 50.0,
     random_seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    parallel: bool = True,
+    n_jobs: int = -1
 ) -> np.ndarray:
     """
     Compute Wasserstein DRO-optimal order quantities for all predictions.
 
     Samples demand scenarios from prediction intervals, then optimizes
     using distributionally robust optimization with Wasserstein ambiguity.
+    Uses parallel processing for speedup.
 
     Parameters
     ----------
@@ -398,31 +458,54 @@ def compute_order_quantities_dro(
         Random seed for reproducibility.
     verbose : bool
         Whether to print progress.
+    parallel : bool
+        Whether to use parallel processing. Default True for speedup.
+    n_jobs : int
+        Number of parallel jobs. -1 uses all available cores.
 
     Returns
     -------
     np.ndarray
         Optimal robust order quantities.
     """
+    n_days = len(point_pred)
+
     if verbose:
-        logger.info(f"Optimizing Wasserstein DRO (epsilon={epsilon}, beta={beta}) for {len(point_pred)} days...")
+        logger.info(f"Optimizing Wasserstein DRO (epsilon={epsilon}, beta={beta}) for {n_days} days...")
 
-    rng = np.random.RandomState(random_seed)
-    order_quantities = []
+    # Determine number of workers
+    if n_jobs == -1:
+        n_workers = _NUM_WORKERS
+    else:
+        n_workers = min(n_jobs, _NUM_WORKERS)
 
-    for i in range(len(point_pred)):
-        if verbose and (i + 1) % 50 == 0:
-            logger.info(f"Processed {i + 1}/{len(point_pred)} days...")
+    # For small number of days, sequential is faster (avoid overhead)
+    if not parallel or n_days < 10:
+        rng = np.random.RandomState(random_seed)
+        order_quantities = []
 
-        # Sample demand scenarios from prediction interval
-        demand_samples = rng.uniform(lower[i], upper[i], n_samples)
+        for i in range(n_days):
+            demand_samples = rng.uniform(lower[i], upper[i], n_samples)
+            q_opt = optimize_wasserstein_dro_single(
+                demand_samples, epsilon, beta,
+                ordering_cost, holding_cost, stockout_cost
+            )
+            order_quantities.append(q_opt)
 
-        # Optimize using Wasserstein DRO
-        q_opt = optimize_wasserstein_dro_single(
-            demand_samples, epsilon, beta,
-            ordering_cost, holding_cost, stockout_cost
-        )
-        order_quantities.append(q_opt)
+        return np.array(order_quantities)
+
+    # Parallel processing for larger problems
+    args_list = [
+        (lower[i], upper[i], n_samples, random_seed + i, epsilon, beta,
+         ordering_cost, holding_cost, stockout_cost)
+        for i in range(n_days)
+    ]
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        order_quantities = list(executor.map(_optimize_dro_single_worker, args_list))
+
+    if verbose:
+        logger.info(f"Completed DRO optimization for {n_days} days using {n_workers} workers")
 
     return np.array(order_quantities)
 
@@ -630,6 +713,38 @@ def optimize_multi_period_cvar_single(
         return np.array(optimal_quantities)
 
 
+def _optimize_multi_period_joint_worker(args):
+    """Worker for parallel multi-period joint optimization."""
+    (lower_dict, upper_dict, horizons, n_samples, seed, beta,
+     ordering_cost, holding_cost, stockout_cost, aggregation) = args
+    rng = np.random.RandomState(seed)
+
+    demand_scenarios = {}
+    for h in horizons:
+        demand_scenarios[h] = rng.uniform(lower_dict[h], upper_dict[h], n_samples)
+
+    return optimize_multi_period_cvar_single(
+        demand_scenarios, horizons, beta,
+        ordering_cost, holding_cost, stockout_cost,
+        aggregation, joint_optimization=True
+    )
+
+
+def _optimize_multi_period_separate_worker(args):
+    """Worker for parallel multi-period separate optimization."""
+    (lower_dict, upper_dict, horizons, n_samples, seed, beta,
+     ordering_cost, holding_cost, stockout_cost) = args
+    rng = np.random.RandomState(seed)
+
+    results = {}
+    for h in horizons:
+        demand_samples = rng.uniform(lower_dict[h], upper_dict[h], n_samples)
+        results[h] = optimize_cvar_single(
+            demand_samples, beta, ordering_cost, holding_cost, stockout_cost
+        )
+    return results
+
+
 def compute_order_quantities_multi_period_cvar(
     point_pred: Dict[int, np.ndarray],
     lower: Dict[int, np.ndarray],
@@ -643,13 +758,16 @@ def compute_order_quantities_multi_period_cvar(
     aggregation: str = "mean",
     joint_optimization: bool = True,
     random_seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    parallel: bool = True,
+    n_jobs: int = -1
 ) -> Dict[int, np.ndarray]:
     """
     Compute CVaR-optimal order quantities for multi-period predictions.
 
     For each forecast origin, samples demand scenarios from prediction
     intervals at each horizon, then optimizes considering all horizons jointly.
+    Uses parallel processing for speedup.
 
     Parameters
     ----------
@@ -675,6 +793,10 @@ def compute_order_quantities_multi_period_cvar(
         Random seed for reproducibility.
     verbose : bool
         Whether to print progress.
+    parallel : bool
+        Whether to use parallel processing. Default True.
+    n_jobs : int
+        Number of parallel jobs. -1 uses all available cores.
 
     Returns
     -------
@@ -682,60 +804,88 @@ def compute_order_quantities_multi_period_cvar(
         Optimal order quantities for each horizon.
         If joint_optimization=True, all horizons get the same quantities.
     """
+    n_days = len(point_pred[horizons[0]])
+
     if verbose:
-        logger.info(f"Optimizing multi-period CVaR (beta={beta}) for {len(point_pred[horizons[0]])} days...")
+        logger.info(f"Optimizing multi-period CVaR (beta={beta}) for {n_days} days...")
         logger.info(f"  Horizons: {horizons}")
         logger.info(f"  Aggregation: {aggregation}")
         logger.info(f"  Joint optimization: {joint_optimization}")
 
-    rng = np.random.RandomState(random_seed)
-    n_days = len(point_pred[horizons[0]])
+    # Determine number of workers
+    if n_jobs == -1:
+        n_workers = _NUM_WORKERS
+    else:
+        n_workers = min(n_jobs, _NUM_WORKERS)
 
+    # For small number of days, sequential is faster
+    if not parallel or n_days < 10:
+        rng = np.random.RandomState(random_seed)
+
+        if joint_optimization:
+            joint_orders = []
+            for i in range(n_days):
+                demand_scenarios = {}
+                for h in horizons:
+                    demand_scenarios[h] = rng.uniform(lower[h][i], upper[h][i], n_samples)
+                q_opt = optimize_multi_period_cvar_single(
+                    demand_scenarios, horizons, beta,
+                    ordering_cost, holding_cost, stockout_cost,
+                    aggregation, joint_optimization=True
+                )
+                joint_orders.append(q_opt)
+            joint_orders = np.array(joint_orders)
+            return {h: joint_orders for h in horizons}
+        else:
+            horizon_orders = {h: [] for h in horizons}
+            for i in range(n_days):
+                for h in horizons:
+                    demand_samples = rng.uniform(lower[h][i], upper[h][i], n_samples)
+                    q_opt = optimize_cvar_single(
+                        demand_samples, beta, ordering_cost, holding_cost, stockout_cost
+                    )
+                    horizon_orders[h].append(q_opt)
+            return {h: np.array(horizon_orders[h]) for h in horizons}
+
+    # Parallel processing
     if joint_optimization:
-        # Single order quantity for each day (same across horizons)
-        joint_orders = []
+        args_list = [
+            ({h: lower[h][i] for h in horizons},
+             {h: upper[h][i] for h in horizons},
+             horizons, n_samples, random_seed + i, beta,
+             ordering_cost, holding_cost, stockout_cost, aggregation)
+            for i in range(n_days)
+        ]
 
-        for i in range(n_days):
-            if verbose and (i + 1) % 50 == 0:
-                logger.info(f"Processed {i + 1}/{n_days} days...")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            joint_orders = list(executor.map(_optimize_multi_period_joint_worker, args_list))
 
-            # Sample demand scenarios for each horizon
-            demand_scenarios = {}
-            for h in horizons:
-                demand_scenarios[h] = rng.uniform(lower[h][i], upper[h][i], n_samples)
+        if verbose:
+            logger.info(f"Completed multi-period optimization for {n_days} days using {n_workers} workers")
 
-            # Optimize jointly
-            q_opt = optimize_multi_period_cvar_single(
-                demand_scenarios, horizons, beta,
-                ordering_cost, holding_cost, stockout_cost,
-                aggregation, joint_optimization=True
-            )
-            joint_orders.append(q_opt)
-
-        # Return same quantities for all horizons
         joint_orders = np.array(joint_orders)
         return {h: joint_orders for h in horizons}
 
     else:
-        # Optimize separately for each horizon
+        args_list = [
+            ({h: lower[h][i] for h in horizons},
+             {h: upper[h][i] for h in horizons},
+             horizons, n_samples, random_seed + i, beta,
+             ordering_cost, holding_cost, stockout_cost)
+            for i in range(n_days)
+        ]
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            results_list = list(executor.map(_optimize_multi_period_separate_worker, args_list))
+
+        if verbose:
+            logger.info(f"Completed multi-period optimization for {n_days} days using {n_workers} workers")
+
+        # Reorganize results by horizon
         horizon_orders = {h: [] for h in horizons}
-
-        for i in range(n_days):
-            if verbose and (i + 1) % 50 == 0:
-                logger.info(f"Processed {i + 1}/{n_days} days...")
-
-            # Sample demand scenarios for each horizon
-            demand_scenarios = {}
+        for result in results_list:
             for h in horizons:
-                demand_scenarios[h] = rng.uniform(lower[h][i], upper[h][i], n_samples)
-
-            # Optimize for each horizon
-            for h in horizons:
-                q_opt = optimize_cvar_single(
-                    demand_scenarios[h], beta,
-                    ordering_cost, holding_cost, stockout_cost
-                )
-                horizon_orders[h].append(q_opt)
+                horizon_orders[h].append(result[h])
 
         return {h: np.array(horizon_orders[h]) for h in horizons}
 
