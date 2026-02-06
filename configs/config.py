@@ -15,11 +15,16 @@ import torch
 
 @dataclass
 class CostConfig:
-    """Newsvendor cost parameters."""
+    """Newsvendor cost parameters with carryover and capacity constraints."""
     ordering_cost: float = 10.0
     holding_cost: float = 2.0
     stockout_cost: float = 50.0
-    
+
+    # Inventory dynamics
+    carryover_rate: float = 0.95  # Fraction of leftover inventory that carries to next period (0=no carryover, 1=full)
+    capacity: float = 200.0  # Maximum warehouse storage capacity (units)
+    initial_inventory: float = 0.0  # Starting inventory level
+
     @property
     def critical_ratio(self) -> float:
         """Critical ratio for newsvendor problem: cu / (cu + co)"""

@@ -891,6 +891,158 @@ def compute_order_quantities_multi_period_cvar(
 
 
 @dataclass
+class InventorySimulationResult:
+    """Results from inventory simulation with carryover and capacity constraints."""
+    actual_orders: np.ndarray  # Adjusted order quantities (after capacity constraints)
+    inventory_levels: np.ndarray  # Inventory level at start of each period (before demand)
+    carryover_inventory: np.ndarray  # Inventory carried over from previous period
+    costs: np.ndarray  # Total cost per period
+    ordering_costs: np.ndarray  # Ordering cost component per period
+    holding_costs: np.ndarray  # Holding cost component per period
+    stockout_costs: np.ndarray  # Stockout cost component per period
+    demands: np.ndarray  # Actual demands
+    capacity_utilization: np.ndarray  # Fraction of capacity used each period
+
+    @property
+    def total_cost(self) -> float:
+        return float(np.sum(self.costs))
+
+    @property
+    def mean_cost(self) -> float:
+        return float(np.mean(self.costs))
+
+    @property
+    def cvar_90(self) -> float:
+        sorted_costs = np.sort(self.costs)
+        idx = int(np.ceil(0.90 * len(sorted_costs)))
+        return float(np.mean(sorted_costs[idx:])) if idx < len(sorted_costs) else float(sorted_costs[-1])
+
+    @property
+    def cvar_95(self) -> float:
+        sorted_costs = np.sort(self.costs)
+        idx = int(np.ceil(0.95 * len(sorted_costs)))
+        return float(np.mean(sorted_costs[idx:])) if idx < len(sorted_costs) else float(sorted_costs[-1])
+
+    @property
+    def service_level(self) -> float:
+        return float(np.mean(self.inventory_levels >= self.demands))
+
+    @property
+    def avg_capacity_utilization(self) -> float:
+        return float(np.mean(self.capacity_utilization))
+
+    @property
+    def avg_carryover(self) -> float:
+        return float(np.mean(self.carryover_inventory))
+
+
+def simulate_inventory_with_carryover(
+    target_order_quantities: np.ndarray,
+    actual_demands: np.ndarray,
+    initial_inventory: float = 0.0,
+    carryover_rate: float = 0.95,
+    capacity: float = 200.0,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0
+) -> InventorySimulationResult:
+    """
+    Simulate inventory dynamics with carryover and capacity constraints.
+
+    At each period t:
+    1. Start with carryover inventory I_t from previous period
+    2. Compute actual order: q_t = min(target_q_t, capacity - I_t)
+    3. Available inventory: A_t = I_t + q_t
+    4. Demand d_t arrives
+    5. Overage: max(0, A_t - d_t), Underage: max(0, d_t - A_t)
+    6. Cost: ordering_cost * q_t + holding_cost * overage + stockout_cost * underage
+    7. Carryover to next period: I_{t+1} = carryover_rate * overage
+
+    Parameters
+    ----------
+    target_order_quantities : np.ndarray
+        Desired order quantities from the optimization (before constraints).
+    actual_demands : np.ndarray
+        Actual realized demand for each period.
+    initial_inventory : float
+        Starting inventory level.
+    carryover_rate : float
+        Fraction of leftover inventory that carries to next period (0 to 1).
+        0 = no carryover (standard newsvendor), 1 = full carryover.
+    capacity : float
+        Maximum warehouse storage capacity.
+    ordering_cost : float
+        Cost per unit ordered.
+    holding_cost : float
+        Cost per unit of overage.
+    stockout_cost : float
+        Cost per unit of underage.
+
+    Returns
+    -------
+    InventorySimulationResult
+        Detailed simulation results including costs, inventory levels, etc.
+    """
+    n_days = len(target_order_quantities)
+    inventory = initial_inventory
+
+    actual_orders = np.zeros(n_days)
+    inventory_levels = np.zeros(n_days)
+    carryover_inv = np.zeros(n_days)
+    costs = np.zeros(n_days)
+    ord_costs = np.zeros(n_days)
+    hold_costs = np.zeros(n_days)
+    stock_costs = np.zeros(n_days)
+    cap_util = np.zeros(n_days)
+
+    for t in range(n_days):
+        carryover_inv[t] = inventory
+
+        # Constrain order by capacity (can't exceed warehouse limit)
+        max_order = max(0, capacity - inventory)
+        actual_order = max(0, min(target_order_quantities[t], max_order))
+
+        # Available inventory after ordering
+        available = inventory + actual_order
+        inventory_levels[t] = available
+
+        # Capacity utilization
+        cap_util[t] = available / capacity if capacity > 0 else 0.0
+
+        # Demand realization
+        demand = actual_demands[t]
+
+        # Cost components
+        overage = max(0, available - demand)
+        underage = max(0, demand - available)
+
+        oc = ordering_cost * actual_order
+        hc = holding_cost * overage
+        sc = stockout_cost * underage
+
+        actual_orders[t] = actual_order
+        ord_costs[t] = oc
+        hold_costs[t] = hc
+        stock_costs[t] = sc
+        costs[t] = oc + hc + sc
+
+        # Carryover: leftover inventory carries to next period (possibly degraded)
+        inventory = overage * carryover_rate
+
+    return InventorySimulationResult(
+        actual_orders=actual_orders,
+        inventory_levels=inventory_levels,
+        carryover_inventory=carryover_inv,
+        costs=costs,
+        ordering_costs=ord_costs,
+        holding_costs=hold_costs,
+        stockout_costs=stock_costs,
+        demands=actual_demands.copy(),
+        capacity_utilization=cap_util
+    )
+
+
+@dataclass
 class MultiPeriodCostMetrics:
     """Container for multi-period cost metrics."""
     # Per-horizon metrics
