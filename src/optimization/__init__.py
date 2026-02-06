@@ -16,6 +16,9 @@ from .cvar import (
     compute_order_quantities_multi_period_cvar,
     MultiPeriodCostMetrics,
     compute_multi_period_metrics,
+    # Inventory simulation with carryover and capacity
+    InventorySimulationResult,
+    simulate_inventory_with_carryover,
 )
 
 __all__ = [
@@ -34,4 +37,7 @@ __all__ = [
     "compute_order_quantities_multi_period_cvar",
     "MultiPeriodCostMetrics",
     "compute_multi_period_metrics",
+    # Inventory simulation with carryover and capacity
+    "InventorySimulationResult",
+    "simulate_inventory_with_carryover",
 ]
