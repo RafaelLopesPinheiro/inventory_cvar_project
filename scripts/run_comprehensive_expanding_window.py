@@ -2,7 +2,7 @@
 """
 Comprehensive Multi-SKU Expanding Window Experiment with Inventory Dynamics
 
-This script compares 5 forecasting/optimization methods for inventory management
+This script compares 6 forecasting/optimization methods for inventory management
 using expanding window cross-validation, enriched with carryover and capacity
 constraints that model realistic warehouse operations.
 
@@ -13,13 +13,20 @@ Unlike the standard single-period newsvendor, this experiment models:
 - Capacity: Warehouse has a maximum storage limit
 - Sequential decisions: Each period's order depends on current inventory state
 
-MODEL HIERARCHY (5 Methods):
+MODEL HIERARCHY (6 Methods):
 =============================
 1. SAA                 - Sample Average Approximation (OR benchmark)
 2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
 3. Wasserstein DRO     - Distributionally Robust Optimization
 4. EnbPI + CQR + CVaR  - Ensemble Batch PI + Conformalized Quantile Regression + CVaR
-5. Seer               - Oracle upper bound (perfect foresight)
+5. SPO (End-to-End)    - Smart Predict-then-Optimize (decision-focused learning)
+6. Seer               - Oracle upper bound (perfect foresight)
+
+STATISTICAL VALIDITY:
+=====================
+- Paired t-tests and Wilcoxon signed-rank tests across windows
+- Bonferroni correction for multiple comparisons
+- Effect size (Cohen's d) for practical significance
 
 KEY EXPERIMENTAL DESIGN:
 ========================
@@ -51,6 +58,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
+from scipy import stats
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
@@ -66,6 +74,7 @@ from src.data import (
     filter_store_item,
     create_all_features,
     create_rolling_window_splits,
+    prepare_rolling_sequence_data,
     RollingWindowSplit,
 )
 from src.models import (
@@ -73,6 +82,7 @@ from src.models import (
     ConformalPrediction,
     EnsembleBatchPI,
     DistributionallyRobustOptimization,
+    SPOEndToEnd,
     Seer,
     PredictionResult,
 )
@@ -108,17 +118,19 @@ MODEL_CATEGORIES = {
     "2_DistributionFree": ["Conformal_CVaR"],
     "3_RobustOptimization": ["Wasserstein_DRO"],
     "4_YourContribution": ["EnbPI_CQR_CVaR"],
-    "5_Oracle": ["Seer"],
+    "5_EndToEnd": ["SPO_EndToEnd"],
+    "6_Oracle": ["Seer"],
 }
 
-MODEL_ORDER = ['SAA', 'Conformal_CVaR', 'Wasserstein_DRO', 'EnbPI_CQR_CVaR', 'Seer']
+MODEL_ORDER = ['SAA', 'Conformal_CVaR', 'Wasserstein_DRO', 'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'Seer']
 
 MODEL_DISPLAY_NAMES = {
     "SAA": "1. SAA",
     "Conformal_CVaR": "2. Conformal + CVaR",
     "Wasserstein_DRO": "3. Wasserstein DRO",
     "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR",
-    "Seer": "5. Seer (Oracle)",
+    "SPO_EndToEnd": "5. SPO (End-to-End)",
+    "Seer": "6. Seer (Oracle)",
 }
 
 MODEL_COLORS = {
@@ -126,6 +138,7 @@ MODEL_COLORS = {
     "Conformal_CVaR": "#ff7f0e",
     "Wasserstein_DRO": "#9467bd",
     "EnbPI_CQR_CVaR": "#d62728",
+    "SPO_EndToEnd": "#e377c2",
     "Seer": "#2ca02c",
 }
 
@@ -216,7 +229,7 @@ def run_single_window(
     config: ExperimentConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, InventorySimulationResult]]:
     """
-    Run all 5 models on a single expanding window with carryover and capacity.
+    Run all 6 models on a single expanding window with carryover and capacity.
 
     Parameters
     ----------
@@ -396,7 +409,73 @@ def run_single_window(
         logger.debug(f"EnbPI+CQR+CVaR failed: {e}")
 
     # =========================================================================
-    # 5. SEER (ORACLE - UPPER BOUND)
+    # 5. SPO/END-TO-END (DECISION-FOCUSED LEARNING)
+    # =========================================================================
+    try:
+        start_time = time.time()
+
+        # Prepare sequence data for SPO (LSTM-based model)
+        seq_data = prepare_rolling_sequence_data(
+            window_split,
+            seq_length=config.data.sequence_length,
+            prediction_horizon=config.data.prediction_horizon
+        )
+        X_train_seq, y_train_seq = seq_data.X_train, seq_data.y_train
+        X_cal_seq, y_cal_seq = seq_data.X_cal, seq_data.y_cal
+        X_test_seq, y_test_seq = seq_data.X_test, seq_data.y_test
+
+        spo_model = SPOEndToEnd(
+            alpha=config.conformal.alpha,
+            sequence_length=config.data.sequence_length,
+            hidden_size=64,
+            num_layers=2,
+            dropout=0.2,
+            learning_rate=0.001,
+            epochs=getattr(config, '_spo_epochs', 50),
+            batch_size=32,
+            ordering_cost=costs.ordering_cost,
+            holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost,
+            beta=config.cvar.beta,
+            random_state=config.random_seed,
+            device=config.device
+        )
+        spo_model.fit(X_train_seq, y_train_seq, X_cal_seq, y_cal_seq)
+        spo_pred = spo_model.predict(X_test_seq)
+        spo_orders = compute_order_quantities_cvar(
+            spo_pred.point, spo_pred.lower, spo_pred.upper,
+            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+            verbose=False
+        )
+
+        # Align to same test length as traditional methods
+        n_test_trad = len(y_test)
+        n_test_seq = len(y_test_seq)
+        # Use the sequence-aligned test set for simulation
+        spo_demand = y_test[-n_test_seq:] if n_test_seq < n_test_trad else y_test_seq
+
+        spo_sim = simulate_inventory_with_carryover(
+            spo_orders, spo_demand,
+            initial_inventory=costs.initial_inventory,
+            carryover_rate=costs.carryover_rate,
+            capacity=costs.capacity,
+            ordering_cost=costs.ordering_cost,
+            holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost
+        )
+        timings["SPO_EndToEnd"] = time.time() - start_time
+        sim_results["SPO_EndToEnd"] = spo_sim
+        results["SPO_EndToEnd"] = {
+            'pred': spo_pred, 'target_orders': spo_orders,
+            'sim': spo_sim, 'time': timings["SPO_EndToEnd"]
+        }
+    except Exception as e:
+        logger.debug(f"SPO/End-to-End failed: {e}")
+
+    # =========================================================================
+    # 6. SEER (ORACLE - UPPER BOUND)
     # =========================================================================
     try:
         start_time = time.time()
@@ -1127,6 +1206,19 @@ def create_summary_report(
         if 'Wasserstein_DRO' in mean_costs and 'EnbPI_CQR_CVaR' in mean_costs:
             imp = (mean_costs['Wasserstein_DRO'] - mean_costs['EnbPI_CQR_CVaR']) / mean_costs['Wasserstein_DRO'] * 100
             report.append(f"  Improvement vs DRO:  {imp:+.1f}%")
+        if 'SPO_EndToEnd' in mean_costs and 'EnbPI_CQR_CVaR' in mean_costs:
+            imp = (mean_costs['SPO_EndToEnd'] - mean_costs['EnbPI_CQR_CVaR']) / mean_costs['SPO_EndToEnd'] * 100
+            report.append(f"  Improvement vs SPO:  {imp:+.1f}%")
+
+    # SPO/End-to-End performance
+    if 'SPO_EndToEnd' in combined_df['Method'].values:
+        report.append(f"\n[SPO/END-TO-END BASELINE]")
+        spo_df = combined_df[combined_df['Method'] == 'SPO_EndToEnd']
+        report.append(f"  Mean Cost:           ${spo_df['Mean_Cost'].mean():.2f}")
+        report.append(f"  CVaR-90:             ${spo_df['CVaR_90'].mean():.2f}")
+        report.append(f"  Service Level:       {spo_df['Service_Level'].mean()*100:.1f}%")
+        report.append(f"  Capacity Util:       {spo_df['Avg_Capacity_Util'].mean()*100:.1f}%")
+        report.append(f"  Avg Carryover:       {spo_df['Avg_Carryover'].mean():.1f} units")
 
     # Detailed results table
     report.append("\n" + "-" * 80)
@@ -1179,6 +1271,279 @@ def create_summary_report(
 
 
 # =============================================================================
+# STATISTICAL VALIDITY TESTS
+# =============================================================================
+
+def compute_statistical_tests(
+    combined_df: pd.DataFrame,
+    output_dir: str,
+    reference_method: str = "EnbPI_CQR_CVaR",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Test statistical validity of results across expanding windows.
+
+    Performs paired comparisons between the reference method and all others
+    using paired t-tests and Wilcoxon signed-rank tests on per-window metrics.
+    Applies Bonferroni correction for multiple comparisons and reports
+    Cohen's d effect sizes.
+
+    Parameters
+    ----------
+    combined_df : pd.DataFrame
+        All window results with columns Method, Mean_Cost, CVaR_90, etc.
+    output_dir : str
+        Directory to save statistical test results.
+    reference_method : str
+        Method to compare against (default: EnbPI_CQR_CVaR).
+    alpha : float
+        Significance level before correction (default: 0.05).
+
+    Returns
+    -------
+    pd.DataFrame
+        Statistical test results for all method-metric pairs.
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("STATISTICAL VALIDITY TESTS")
+    logger.info("=" * 80)
+
+    existing_methods = [m for m in MODEL_ORDER if m in combined_df['Method'].unique()]
+
+    if reference_method not in existing_methods:
+        logger.warning(f"Reference method '{reference_method}' not found. "
+                       f"Using first non-oracle method.")
+        reference_method = [m for m in existing_methods if m != 'Seer'][0]
+
+    test_metrics = ['Mean_Cost', 'CVaR_90', 'CVaR_95', 'Service_Level']
+    comparison_methods = [m for m in existing_methods if m != reference_method]
+
+    # Number of comparisons for Bonferroni correction
+    n_comparisons = len(comparison_methods) * len(test_metrics)
+    alpha_corrected = alpha / n_comparisons if n_comparisons > 0 else alpha
+
+    logger.info(f"Reference method: {get_model_display_name(reference_method)}")
+    logger.info(f"Comparisons: {len(comparison_methods)} methods x {len(test_metrics)} metrics = {n_comparisons}")
+    logger.info(f"Bonferroni-corrected alpha: {alpha_corrected:.6f}")
+
+    # Group by window (and SKU if multi-SKU) to get per-window observations
+    group_cols = ['window_idx']
+    if 'store_id' in combined_df.columns and 'item_id' in combined_df.columns:
+        group_cols = ['store_id', 'item_id', 'window_idx']
+
+    stat_results = []
+
+    for metric in test_metrics:
+        if metric not in combined_df.columns:
+            continue
+
+        # Get per-window values for reference method
+        ref_df = combined_df[combined_df['Method'] == reference_method].set_index(group_cols)[metric]
+
+        for comp_method in comparison_methods:
+            comp_df = combined_df[combined_df['Method'] == comp_method].set_index(group_cols)[metric]
+
+            # Align on common windows
+            common_idx = ref_df.index.intersection(comp_df.index)
+            if len(common_idx) < 3:
+                logger.warning(f"  Skipping {comp_method} vs {reference_method} for {metric}: "
+                               f"only {len(common_idx)} paired observations")
+                continue
+
+            ref_vals = ref_df.loc[common_idx].values.astype(float)
+            comp_vals = comp_df.loc[common_idx].values.astype(float)
+            diff = ref_vals - comp_vals
+            n_obs = len(diff)
+
+            # Paired t-test
+            t_stat, t_pval = stats.ttest_rel(ref_vals, comp_vals)
+
+            # Wilcoxon signed-rank test (non-parametric alternative)
+            try:
+                # Wilcoxon requires non-zero differences
+                nonzero_diff = diff[diff != 0]
+                if len(nonzero_diff) >= 5:
+                    w_stat, w_pval = stats.wilcoxon(nonzero_diff)
+                else:
+                    w_stat, w_pval = np.nan, np.nan
+            except ValueError:
+                w_stat, w_pval = np.nan, np.nan
+
+            # Cohen's d effect size
+            pooled_std = np.sqrt((np.var(ref_vals, ddof=1) + np.var(comp_vals, ddof=1)) / 2)
+            cohens_d = (np.mean(ref_vals) - np.mean(comp_vals)) / pooled_std if pooled_std > 0 else 0.0
+
+            # Effect size interpretation
+            abs_d = abs(cohens_d)
+            if abs_d < 0.2:
+                effect_interp = "negligible"
+            elif abs_d < 0.5:
+                effect_interp = "small"
+            elif abs_d < 0.8:
+                effect_interp = "medium"
+            else:
+                effect_interp = "large"
+
+            # For cost metrics, negative diff means reference is better (lower cost)
+            # For service level, positive diff means reference is better (higher SL)
+            is_cost_metric = metric in ['Mean_Cost', 'CVaR_90', 'CVaR_95']
+            ref_better = np.mean(diff) < 0 if is_cost_metric else np.mean(diff) > 0
+
+            stat_results.append({
+                'Metric': metric,
+                'Reference': get_model_display_name(reference_method),
+                'Comparison': get_model_display_name(comp_method),
+                'Ref_Mean': np.mean(ref_vals),
+                'Comp_Mean': np.mean(comp_vals),
+                'Mean_Diff': np.mean(diff),
+                'Std_Diff': np.std(diff, ddof=1),
+                'N_Observations': n_obs,
+                'T_Statistic': t_stat,
+                'T_PValue': t_pval,
+                'T_Significant': t_pval < alpha_corrected,
+                'Wilcoxon_Stat': w_stat,
+                'Wilcoxon_PValue': w_pval,
+                'Wilcoxon_Significant': w_pval < alpha_corrected if not np.isnan(w_pval) else False,
+                'Cohens_d': cohens_d,
+                'Effect_Size': effect_interp,
+                'Ref_Better': ref_better,
+                'Alpha_Corrected': alpha_corrected,
+            })
+
+    stat_df = pd.DataFrame(stat_results)
+
+    if stat_df.empty:
+        logger.warning("No statistical tests could be performed (insufficient data).")
+        return stat_df
+
+    # Print results
+    logger.info(f"\nPaired comparisons vs {get_model_display_name(reference_method)}:")
+    logger.info(f"{'Metric':<15} {'vs Method':<25} {'Diff':>8} {'t-stat':>8} {'p-val':>10} {'Sig?':>5} {'Cohen d':>8} {'Effect':>10}")
+    logger.info("-" * 100)
+
+    for _, row in stat_df.iterrows():
+        sig_marker = "*" if row['T_Significant'] else ""
+        logger.info(
+            f"{row['Metric']:<15} "
+            f"{row['Comparison']:<25} "
+            f"{row['Mean_Diff']:>+8.2f} "
+            f"{row['T_Statistic']:>8.3f} "
+            f"{row['T_PValue']:>10.6f} "
+            f"{'YES' if row['T_Significant'] else 'no':>5}{sig_marker} "
+            f"{row['Cohens_d']:>+8.3f} "
+            f"{row['Effect_Size']:>10}"
+        )
+
+    # Summary of significance
+    n_sig_t = stat_df['T_Significant'].sum()
+    n_sig_w = stat_df['Wilcoxon_Significant'].sum()
+    n_ref_better = stat_df['Ref_Better'].sum()
+    logger.info(f"\nSummary:")
+    logger.info(f"  Significant (paired t-test, Bonferroni): {n_sig_t}/{len(stat_df)}")
+    logger.info(f"  Significant (Wilcoxon, Bonferroni):      {n_sig_w}/{len(stat_df)}")
+    logger.info(f"  Reference method better in:              {n_ref_better}/{len(stat_df)} comparisons")
+
+    # Save
+    stat_path = os.path.join(output_dir, "statistical_tests.csv")
+    stat_df.to_csv(stat_path, index=False)
+    logger.info(f"\n[OK] Saved statistical tests: {stat_path}")
+
+    # Create statistical test visualization
+    _plot_statistical_results(stat_df, output_dir, reference_method)
+
+    return stat_df
+
+
+def _plot_statistical_results(
+    stat_df: pd.DataFrame,
+    output_dir: str,
+    reference_method: str,
+):
+    """Create visualizations for statistical test results."""
+    if stat_df.empty:
+        return
+
+    # =========================================================================
+    # P-value heatmap
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Paired t-test p-values
+    metrics = stat_df['Metric'].unique()
+    methods = stat_df['Comparison'].unique()
+
+    pval_matrix = pd.DataFrame(index=methods, columns=metrics, dtype=float)
+    effect_matrix = pd.DataFrame(index=methods, columns=metrics, dtype=float)
+
+    for _, row in stat_df.iterrows():
+        pval_matrix.loc[row['Comparison'], row['Metric']] = row['T_PValue']
+        effect_matrix.loc[row['Comparison'], row['Metric']] = row['Cohens_d']
+
+    # Log-transform p-values for visualization
+    pval_log = -np.log10(pval_matrix.astype(float).clip(lower=1e-20))
+
+    ax = axes[0]
+    pval_annot = pval_matrix.apply(lambda col: col.map(lambda x: f'{x:.4f}' if pd.notna(x) else ''))
+    sns.heatmap(pval_log, annot=pval_annot,
+                fmt='', cmap='RdYlGn', ax=ax, linewidths=0.5, linecolor='white',
+                vmin=0, vmax=max(5, pval_log.max().max()))
+    ax.set_title(f'Paired t-test p-values vs {get_model_display_name(reference_method)}\n'
+                 f'(color: -log10(p), annotation: raw p-value)',
+                 fontsize=11, fontweight='bold')
+    ax.set_ylabel('')
+
+    # Effect sizes
+    ax = axes[1]
+    sns.heatmap(effect_matrix.astype(float), annot=True, fmt='.3f',
+                cmap='RdBu_r', center=0, ax=ax, linewidths=0.5, linecolor='white')
+    ax.set_title(f"Cohen's d Effect Size vs {get_model_display_name(reference_method)}\n"
+                 f'(negative = reference better for cost metrics)',
+                 fontsize=11, fontweight='bold')
+    ax.set_ylabel('')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'statistical_tests.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # =========================================================================
+    # Forest plot of mean differences with confidence intervals
+    # =========================================================================
+    fig, ax = plt.subplots(figsize=(12, max(6, len(stat_df) * 0.4)))
+
+    y_positions = range(len(stat_df))
+    labels = []
+    for _, row in stat_df.iterrows():
+        labels.append(f"{row['Metric']} | {row['Comparison']}")
+
+    means = stat_df['Mean_Diff'].values
+    stds = stat_df['Std_Diff'].values
+    n_obs = stat_df['N_Observations'].values
+    ci_95 = 1.96 * stds / np.sqrt(n_obs)
+    significants = stat_df['T_Significant'].values
+
+    colors = ['#d62728' if sig else '#1f77b4' for sig in significants]
+
+    ax.errorbar(means, y_positions, xerr=ci_95, fmt='o', color='black',
+                ecolor='gray', elinewidth=1.5, capsize=3, markersize=0)
+    for i, (m, y, c) in enumerate(zip(means, y_positions, colors)):
+        ax.scatter(m, y, color=c, s=80, zorder=5, edgecolors='black', linewidth=0.5)
+
+    ax.axvline(x=0, color='gray', linestyle='--', alpha=0.7, linewidth=1.5)
+    ax.set_yticks(list(y_positions))
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel('Mean Difference (Reference - Comparison)', fontsize=11)
+    ax.set_title(f'Forest Plot: Paired Differences vs {get_model_display_name(reference_method)}\n'
+                 f'(Red = significant after Bonferroni correction, 95% CI shown)',
+                 fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+    ax.invert_yaxis()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'statistical_forest_plot.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+# =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
@@ -1214,7 +1579,7 @@ def main(
 
     logger.info("=" * 80)
     logger.info("INVENTORY OPTIMIZATION WITH CARRYOVER & CAPACITY CONSTRAINTS")
-    logger.info("5-Model Comparison: SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, Seer")
+    logger.info("6-Model Comparison: SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO, Seer")
     logger.info("=" * 80)
     logger.info(f"Stores: {store_ids}")
     logger.info(f"Items: {item_ids}")
@@ -1314,6 +1679,13 @@ def main(
         config.results_dir, config, multi_sku
     )
 
+    # Statistical validity tests
+    stat_df = compute_statistical_tests(
+        combined_df, config.results_dir,
+        reference_method="EnbPI_CQR_CVaR",
+        alpha=0.05,
+    )
+
     # Create summary report
     report = create_summary_report(
         combined_df, aggregated, config.results_dir,
@@ -1349,6 +1721,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data", type=str, default="train.csv",
         help="Path to data file"
+    )
+    parser.add_argument(
+        "--spo-epochs", type=int, default=50,
+        help="Training epochs for SPO model"
     )
     # Inventory dynamics arguments
     parser.add_argument(
@@ -1386,6 +1762,9 @@ if __name__ == "__main__":
     config.results_dir = args.output
     config.rolling_window.enabled = True
     config.data.filepath = args.data
+
+    # Set SPO epochs
+    config._spo_epochs = args.spo_epochs
 
     # Set inventory dynamics
     config.cost.carryover_rate = args.carryover
