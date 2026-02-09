@@ -24,6 +24,8 @@ from .traditional import (
     EnsembleBatchPI,
     # Robust optimization
     DistributionallyRobustOptimization,
+    # SPO with RF base
+    SPORandomForest,
     # Utilities
     ExpectedValue,
     Seer,
@@ -63,6 +65,7 @@ __all__ = [
     "QuantileRegression",       # Direct quantile
     "EnsembleBatchPI",          # EnbPI+CQR
     "DistributionallyRobustOptimization",  # Wasserstein DRO
+    "SPORandomForest",              # SPO with RF base
     "ExpectedValue",
     "Seer",
 
