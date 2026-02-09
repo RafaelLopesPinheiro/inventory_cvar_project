@@ -1860,16 +1860,21 @@ class SPORandomForest(BaseForecaster):
     1. Trains an RF point predictor (same as other methods)
     2. Builds a residual-based demand distribution from calibration data
     3. Computes conformal prediction intervals (for forecast quality evaluation)
-    4. Optimizes the order quantity by solving the ACTUAL newsvendor CVaR
-       problem over the residual-based demand scenarios
+    4. Optimizes the order quantity by minimizing the EXPECTED newsvendor cost
+       over residual-based demand scenarios via numerical optimization
 
-    The key SPO insight: the order quantity is found by minimizing the true
-    downstream newsvendor cost (including ordering, holding, and stockout costs)
-    over demand scenarios, rather than using a simple heuristic like the median.
-
-    This properly differentiates through the newsvendor decision by solving:
-        q* = argmin_q  CVaR_beta[ c_o*q + c_h*max(0,q-D) + c_u*max(0,D-q) ]
+    The proper SPO objective for the newsvendor is expected cost minimization:
+        q* = argmin_q  E_D[ c_o*q + c_h*max(0,q-D) + c_u*max(0,D-q) ]
     where D is sampled from the residual-based predicted distribution.
+
+    This differs from:
+    - SAA: uses the critical quantile heuristic (closed-form shortcut)
+    - Conformal+CVaR: minimizes CVaR (tail risk) over uniform interval samples
+    - DRO: minimizes worst-case CVaR within a Wasserstein ball
+
+    Note: CVaR risk management is handled by the Conformal+CVaR and DRO
+    methods. The SPO contribution is optimizing the actual downstream expected
+    cost, not adding risk aversion on top.
 
     References
     ----------
@@ -1886,7 +1891,6 @@ class SPORandomForest(BaseForecaster):
         ordering_cost: float = 10.0,
         holding_cost: float = 2.0,
         stockout_cost: float = 50.0,
-        cvar_beta: float = 0.90,
         n_scenarios: int = 1000,
         random_state: int = 42,
     ):
@@ -1896,7 +1900,6 @@ class SPORandomForest(BaseForecaster):
         self.ordering_cost = ordering_cost
         self.holding_cost = holding_cost
         self.stockout_cost = stockout_cost
-        self.cvar_beta = cvar_beta
         self.n_scenarios = n_scenarios
 
         self.model = RandomForestRegressor(
@@ -1959,13 +1962,13 @@ class SPORandomForest(BaseForecaster):
 
     def compute_order_quantities(self, X: np.ndarray) -> np.ndarray:
         """
-        Compute decision-focused order quantities by solving the actual
-        newsvendor CVaR optimization over residual-based demand scenarios.
+        Compute decision-focused order quantities by minimizing expected
+        newsvendor cost over residual-based demand scenarios.
 
         For each test point:
         1. Generate demand scenarios: point_pred + bootstrap residuals
-        2. Solve: q* = argmin_q CVaR_beta[newsvendor_cost(q, D)]
-           using the Rockafellar-Uryasev formulation
+        2. Solve: q* = argmin_q E[newsvendor_cost(q, D)]
+           via numerical optimization over the scenario distribution
 
         This is the proper SPO approach: we solve the ACTUAL downstream
         optimization problem rather than using a simplified surrogate.
@@ -1981,48 +1984,43 @@ class SPORandomForest(BaseForecaster):
             sampled_residuals = rng.choice(self.residuals, size=self.n_scenarios, replace=True)
             demand_scenarios = np.maximum(0, point_pred + sampled_residuals)
 
-            # Solve the actual CVaR newsvendor optimization
-            q_opt = self._optimize_cvar_newsvendor(demand_scenarios)
+            # Solve the expected newsvendor cost minimization
+            q_opt = self._optimize_expected_cost(demand_scenarios)
             order_quantities.append(q_opt)
 
         return np.array(order_quantities)
 
-    def _optimize_cvar_newsvendor(self, demand_scenarios: np.ndarray) -> float:
+    def _optimize_expected_cost(self, demand_scenarios: np.ndarray) -> float:
         """
-        Solve the CVaR newsvendor optimization via Rockafellar-Uryasev.
+        Minimize expected newsvendor cost over demand scenarios.
 
-        min_{q, tau}  tau + 1/(N*(1-beta)) * sum max(0, Loss(q, d_i) - tau)
+        min_q  E[ c_o*q + c_h*max(0, q-D) + c_u*max(0, D-q) ]
 
-        where Loss(q, d) = c_o*q + c_h*max(0, q-d) + c_u*max(0, d-q)
+        For the newsvendor, the analytical solution is q* = F_D^{-1}(c_u/(c_u+c_h)),
+        the critical quantile. We solve it numerically to handle the full cost
+        structure (including ordering cost) and non-standard demand distributions.
         """
-        n = len(demand_scenarios)
         c_o = self.ordering_cost
         c_h = self.holding_cost
         c_u = self.stockout_cost
-        beta = self.cvar_beta
+        n = len(demand_scenarios)
 
-        def cvar_objective(x):
-            q, tau = x
+        def expected_cost(q_arr):
+            q = q_arr[0]
             overage = np.maximum(0, q - demand_scenarios)
             underage = np.maximum(0, demand_scenarios - q)
-            losses = c_o * q + c_h * overage + c_u * underage
-            excess = np.maximum(0, losses - tau)
-            return tau + (1.0 / (n * (1.0 - beta))) * np.sum(excess)
+            costs = c_o * q + c_h * overage + c_u * underage
+            return np.mean(costs)
 
-        # Initial guess: critical quantile
+        # Initial guess: critical quantile of demand distribution
         critical_ratio = c_u / (c_u + c_h)
         q0 = np.quantile(demand_scenarios, critical_ratio)
-        tau0 = float(np.median(
-            c_o * q0
-            + c_h * np.maximum(0, q0 - demand_scenarios)
-            + c_u * np.maximum(0, demand_scenarios - q0)
-        ))
 
         result = minimize(
-            cvar_objective,
-            [q0, tau0],
+            expected_cost,
+            [q0],
             method='L-BFGS-B',
-            bounds=[(0, None), (None, None)],
+            bounds=[(0, None)],
         )
 
         return max(0.0, result.x[0])

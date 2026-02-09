@@ -22,7 +22,7 @@ model architecture vs. the uncertainty/optimization method.
 2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
 3. Wasserstein DRO     - Distributionally Robust Optimization
 4. EnbPI + CQR + CVaR  - Ensemble Batch PI + Conformalized Quantile Regression + CVaR
-5. SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
+5. SPO (RF, E[Cost])   - Smart Predict-then-Optimize with RF base + expected cost optimization
 6. Seer               - Oracle upper bound (perfect foresight)
 
 EVALUATION:
@@ -136,7 +136,7 @@ MODEL_DISPLAY_NAMES = {
     "Conformal_CVaR": "2. Conformal + CVaR",
     "Wasserstein_DRO": "3. Wasserstein DRO",
     "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR",
-    "SPO_EndToEnd": "5. SPO (RF, CVaR)",
+    "SPO_EndToEnd": "5. SPO (RF, E[Cost])",
     "Seer": "6. Seer (Oracle)",
 }
 
@@ -465,7 +465,6 @@ def run_single_window(
             ordering_cost=costs.ordering_cost,
             holding_cost=costs.holding_cost,
             stockout_cost=costs.stockout_cost,
-            cvar_beta=config.cvar.beta,
             n_scenarios=config.cvar.n_samples,
             random_state=config.random_seed,
         )
@@ -1288,7 +1287,7 @@ def create_summary_report(
     report.append(f"  Critical Ratio:    {config.cost.critical_ratio:.3f}")
     report.append(f"\nMODEL ARCHITECTURE:")
     report.append(f"  Base Predictor:    Random Forest (equalized across all methods)")
-    report.append(f"  SPO variant:       RF + residual-based CVaR optimization (proper newsvendor)")
+    report.append(f"  SPO variant:       RF + residual-based expected cost optimization (proper newsvendor)")
     report.append(f"\nEXPERIMENT SETTINGS:")
     report.append(f"  Stores: {store_ids}")
     report.append(f"  Items: {item_ids}")
