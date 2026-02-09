@@ -15,12 +15,20 @@ Unlike the standard single-period newsvendor, this experiment models:
 
 MODEL HIERARCHY (6 Methods):
 =============================
+All methods use Random Forest as the base predictor to equalize the effect of
+model architecture vs. the uncertainty/optimization method.
+
 1. SAA                 - Sample Average Approximation (OR benchmark)
 2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
 3. Wasserstein DRO     - Distributionally Robust Optimization
 4. EnbPI + CQR + CVaR  - Ensemble Batch PI + Conformalized Quantile Regression + CVaR
-5. SPO (End-to-End)    - Smart Predict-then-Optimize (decision-focused learning)
+5. SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
 6. Seer               - Oracle upper bound (perfect foresight)
+
+EVALUATION:
+===========
+Reports both forecast quality (coverage, interval width, RMSE, MAE) and
+decision quality (cost, CVaR, service level) independently.
 
 STATISTICAL VALIDITY:
 =====================
@@ -74,7 +82,6 @@ from src.data import (
     filter_store_item,
     create_all_features,
     create_rolling_window_splits,
-    prepare_rolling_sequence_data,
     RollingWindowSplit,
 )
 from src.models import (
@@ -82,7 +89,7 @@ from src.models import (
     ConformalPrediction,
     EnsembleBatchPI,
     DistributionallyRobustOptimization,
-    SPOEndToEnd,
+    SPORandomForest,
     Seer,
     PredictionResult,
 )
@@ -129,7 +136,7 @@ MODEL_DISPLAY_NAMES = {
     "Conformal_CVaR": "2. Conformal + CVaR",
     "Wasserstein_DRO": "3. Wasserstein DRO",
     "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR",
-    "SPO_EndToEnd": "5. SPO (End-to-End)",
+    "SPO_EndToEnd": "5. SPO (RF, CVaR)",
     "Seer": "6. Seer (Oracle)",
 }
 
@@ -224,12 +231,49 @@ def load_expanding_window_data_multi_sku(
 # EXPERIMENT RUNNER WITH INVENTORY DYNAMICS
 # =============================================================================
 
+def _compute_forecast_metrics(
+    y_test: np.ndarray,
+    pred: PredictionResult,
+) -> dict:
+    """Compute forecast quality metrics from predictions."""
+    point = pred.point
+    mae = float(np.mean(np.abs(y_test - point)))
+    rmse = float(np.sqrt(np.mean((y_test - point) ** 2)))
+
+    mask = y_test != 0
+    if mask.sum() > 0:
+        mape = float(np.mean(np.abs((y_test[mask] - point[mask]) / y_test[mask])) * 100)
+    else:
+        mape = np.nan
+
+    coverage = np.nan
+    avg_interval_width = np.nan
+    if pred.lower is not None and pred.upper is not None:
+        coverage = float(np.mean((y_test >= pred.lower) & (y_test <= pred.upper)))
+        avg_interval_width = float(np.mean(pred.upper - pred.lower))
+
+    return {
+        'Coverage': coverage,
+        'Avg_Interval_Width': avg_interval_width,
+        'MAE': mae,
+        'RMSE': rmse,
+        'MAPE': mape,
+    }
+
+
 def run_single_window(
     window_split: RollingWindowSplit,
     config: ExperimentConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, InventorySimulationResult]]:
     """
     Run all 6 models on a single expanding window with carryover and capacity.
+
+    Reports both forecast quality (coverage, interval width, RMSE) and
+    decision quality (cost, CVaR, service level) independently, so reviewers
+    can see where gains come from.
+
+    All methods use Random Forest as the base predictor for fair comparison
+    (equalizing the model architecture effect).
 
     Parameters
     ----------
@@ -409,55 +453,28 @@ def run_single_window(
         logger.debug(f"EnbPI+CQR+CVaR failed: {e}")
 
     # =========================================================================
-    # 5. SPO/END-TO-END (DECISION-FOCUSED LEARNING)
+    # 5. SPO (RF-BASED, DECISION-FOCUSED PREDICT-THEN-OPTIMIZE)
     # =========================================================================
     try:
         start_time = time.time()
 
-        # Prepare sequence data for SPO (LSTM-based model)
-        seq_data = prepare_rolling_sequence_data(
-            window_split,
-            seq_length=config.data.sequence_length,
-            prediction_horizon=config.data.prediction_horizon
-        )
-        X_train_seq, y_train_seq = seq_data.X_train, seq_data.y_train
-        X_cal_seq, y_cal_seq = seq_data.X_cal, seq_data.y_cal
-        X_test_seq, y_test_seq = seq_data.X_test, seq_data.y_test
-
-        spo_model = SPOEndToEnd(
+        spo_model = SPORandomForest(
             alpha=config.conformal.alpha,
-            sequence_length=config.data.sequence_length,
-            hidden_size=64,
-            num_layers=2,
-            dropout=0.2,
-            learning_rate=0.001,
-            epochs=getattr(config, '_spo_epochs', 50),
-            batch_size=32,
+            n_estimators=100,
+            max_depth=10,
             ordering_cost=costs.ordering_cost,
             holding_cost=costs.holding_cost,
             stockout_cost=costs.stockout_cost,
-            beta=config.cvar.beta,
+            cvar_beta=config.cvar.beta,
+            n_scenarios=config.cvar.n_samples,
             random_state=config.random_seed,
-            device=config.device
         )
-        spo_model.fit(X_train_seq, y_train_seq, X_cal_seq, y_cal_seq)
-        spo_pred = spo_model.predict(X_test_seq)
-        spo_orders = compute_order_quantities_cvar(
-            spo_pred.point, spo_pred.lower, spo_pred.upper,
-            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
-            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
-            verbose=False
-        )
-
-        # Align to same test length as traditional methods
-        n_test_trad = len(y_test)
-        n_test_seq = len(y_test_seq)
-        # Use the sequence-aligned test set for simulation
-        spo_demand = y_test[-n_test_seq:] if n_test_seq < n_test_trad else y_test_seq
+        spo_model.fit(X_train, y_train, X_cal, y_cal)
+        spo_pred = spo_model.predict(X_test)
+        spo_orders = spo_model.compute_order_quantities(X_test)
 
         spo_sim = simulate_inventory_with_carryover(
-            spo_orders, spo_demand,
+            spo_orders, y_test,
             initial_inventory=costs.initial_inventory,
             carryover_rate=costs.carryover_rate,
             capacity=costs.capacity,
@@ -472,7 +489,7 @@ def run_single_window(
             'sim': spo_sim, 'time': timings["SPO_EndToEnd"]
         }
     except Exception as e:
-        logger.debug(f"SPO/End-to-End failed: {e}")
+        logger.debug(f"SPO (RF) failed: {e}")
 
     # =========================================================================
     # 6. SEER (ORACLE - UPPER BOUND)
@@ -508,14 +525,30 @@ def run_single_window(
         logger.debug(f"Seer failed: {e}")
 
     # =========================================================================
-    # CREATE SUMMARY DATAFRAME
+    # CREATE SUMMARY DATAFRAME (forecast quality + decision quality)
     # =========================================================================
     summary_data = []
     for method_name, result_data in results.items():
         sim = result_data['sim']
+        pred = result_data['pred']
+
+        # --- Forecast quality metrics ---
+        # Align y_test length with predictions (SPO may have different length)
+        n_pred = len(pred.point)
+        y_eval = y_test[-n_pred:] if n_pred < len(y_test) else y_test[:n_pred]
+        forecast = _compute_forecast_metrics(y_eval, pred)
+
+        # --- Decision quality metrics ---
         row = {
             'Method': method_name,
             'DisplayName': get_model_display_name(method_name),
+            # Forecast quality
+            'Coverage': forecast['Coverage'],
+            'Avg_Interval_Width': forecast['Avg_Interval_Width'],
+            'MAE': forecast['MAE'],
+            'RMSE': forecast['RMSE'],
+            'MAPE': forecast['MAPE'],
+            # Decision quality
             'Mean_Cost': sim.mean_cost,
             'CVaR_90': sim.cvar_90,
             'CVaR_95': sim.cvar_95,
@@ -592,6 +625,118 @@ def create_comprehensive_visualizations(
     sns.set_palette("husl")
 
     existing_methods = [m for m in MODEL_ORDER if m in combined_df['Method'].unique()]
+
+    # =========================================================================
+    # 0a. FORECAST QUALITY: Coverage & Interval Width Comparison
+    # =========================================================================
+    if 'Coverage' in combined_df.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Coverage
+        ax = axes[0]
+        cov_vals = []
+        cov_labels = []
+        cov_colors = []
+        for method in existing_methods:
+            if method in combined_df['Method'].values:
+                cov = combined_df[combined_df['Method'] == method]['Coverage'].mean()
+                if not np.isnan(cov):
+                    cov_vals.append(cov * 100)
+                    cov_labels.append(get_model_display_name(method))
+                    cov_colors.append(MODEL_COLORS.get(method, 'steelblue'))
+
+        if cov_vals:
+            x_pos = range(len(cov_labels))
+            bars = ax.bar(x_pos, cov_vals, color=cov_colors, alpha=0.8,
+                          edgecolor='black', linewidth=0.5)
+            ax.axhline(y=95, color='gray', linestyle='--', alpha=0.7, linewidth=2,
+                       label=f'{int((1-config.conformal.alpha)*100)}% Target')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(cov_labels, rotation=20, ha='right', fontsize=9)
+            ax.set_ylabel('Coverage (%)', fontsize=12)
+            ax.set_title('Prediction Interval Coverage\n(Higher is Better, Target = 95%)',
+                         fontsize=12, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(0, 105)
+            for bar, val in zip(bars, cov_vals):
+                ax.annotate(f'{val:.1f}%',
+                            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                            ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        # Interval Width
+        ax = axes[1]
+        iw_vals = []
+        iw_labels = []
+        iw_colors = []
+        for method in existing_methods:
+            if method in combined_df['Method'].values:
+                iw = combined_df[combined_df['Method'] == method]['Avg_Interval_Width'].mean()
+                if not np.isnan(iw):
+                    iw_vals.append(iw)
+                    iw_labels.append(get_model_display_name(method))
+                    iw_colors.append(MODEL_COLORS.get(method, 'steelblue'))
+
+        if iw_vals:
+            x_pos = range(len(iw_labels))
+            bars = ax.bar(x_pos, iw_vals, color=iw_colors, alpha=0.8,
+                          edgecolor='black', linewidth=0.5)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(iw_labels, rotation=20, ha='right', fontsize=9)
+            ax.set_ylabel('Average Interval Width', fontsize=12)
+            ax.set_title('Prediction Interval Width\n(Narrower is Better at Same Coverage)',
+                         fontsize=12, fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
+            for bar, val in zip(bars, iw_vals):
+                ax.annotate(f'{val:.1f}',
+                            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                            ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'forecast_coverage_width.png'),
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+
+    # =========================================================================
+    # 0b. FORECAST QUALITY: RMSE & MAE Comparison
+    # =========================================================================
+    if 'RMSE' in combined_df.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        for idx, (metric, ylabel, title) in enumerate([
+            ('RMSE', 'RMSE', 'Root Mean Squared Error\n(Lower is Better)'),
+            ('MAE', 'MAE', 'Mean Absolute Error\n(Lower is Better)'),
+        ]):
+            ax = axes[idx]
+            m_vals = []
+            m_labels = []
+            m_colors = []
+            for method in existing_methods:
+                if method in combined_df['Method'].values:
+                    v = combined_df[combined_df['Method'] == method][metric].mean()
+                    if not np.isnan(v):
+                        m_vals.append(v)
+                        m_labels.append(get_model_display_name(method))
+                        m_colors.append(MODEL_COLORS.get(method, 'steelblue'))
+
+            if m_vals:
+                x_pos = range(len(m_labels))
+                bars = ax.bar(x_pos, m_vals, color=m_colors, alpha=0.8,
+                              edgecolor='black', linewidth=0.5)
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels(m_labels, rotation=20, ha='right', fontsize=9)
+                ax.set_ylabel(ylabel, fontsize=12)
+                ax.set_title(title, fontsize=12, fontweight='bold')
+                ax.grid(True, alpha=0.3, axis='y')
+                for bar, val in zip(bars, m_vals):
+                    ax.annotate(f'{val:.2f}',
+                                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                                ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'forecast_rmse_mae.png'),
+                    dpi=150, bbox_inches='tight')
+        plt.close()
 
     # =========================================================================
     # 1. CVaR-90 Comparison (Boxplot)
@@ -891,19 +1036,21 @@ def create_comprehensive_visualizations(
         plt.close()
 
     # =========================================================================
-    # 10. Performance Progression Across Windows
+    # 10. Performance Progression Across Windows (Forecast + Decision)
     # =========================================================================
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(22, 10))
 
     metrics_list = [
+        ('RMSE', 'RMSE (Forecast)'),
+        ('Coverage', 'Coverage (Forecast)'),
+        ('Avg_Interval_Width', 'Interval Width (Forecast)'),
         ('Mean_Cost', 'Mean Cost ($)'),
         ('CVaR_90', 'CVaR-90 ($)'),
         ('Service_Level', 'Service Level'),
-        ('Avg_Capacity_Util', 'Avg Capacity Utilization'),
     ]
 
     for idx, (metric, ylabel) in enumerate(metrics_list):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx // 3, idx % 3]
         for method in existing_methods:
             if method in combined_df['Method'].values:
                 method_data = combined_df[combined_df['Method'] == method].groupby('window_idx')[metric].mean().reset_index()
@@ -929,7 +1076,7 @@ def create_comprehensive_visualizations(
     # =========================================================================
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    metrics = ['Mean_Cost', 'CVaR_90', 'CVaR_95']
+    metrics = ['RMSE', 'Mean_Cost', 'CVaR_90', 'CVaR_95']
     rank_data = []
 
     for method in existing_methods:
@@ -1139,6 +1286,9 @@ def create_summary_report(
     report.append(f"  Capacity:          {config.cost.capacity:.0f} units")
     report.append(f"  Initial Inventory: {config.cost.initial_inventory:.0f} units")
     report.append(f"  Critical Ratio:    {config.cost.critical_ratio:.3f}")
+    report.append(f"\nMODEL ARCHITECTURE:")
+    report.append(f"  Base Predictor:    Random Forest (equalized across all methods)")
+    report.append(f"  SPO variant:       RF + residual-based CVaR optimization (proper newsvendor)")
     report.append(f"\nEXPERIMENT SETTINGS:")
     report.append(f"  Stores: {store_ids}")
     report.append(f"  Items: {item_ids}")
@@ -1220,9 +1370,41 @@ def create_summary_report(
         report.append(f"  Capacity Util:       {spo_df['Avg_Capacity_Util'].mean()*100:.1f}%")
         report.append(f"  Avg Carryover:       {spo_df['Avg_Carryover'].mean():.1f} units")
 
-    # Detailed results table
+    # =====================================================================
+    # FORECAST QUALITY (separate from decision quality)
+    # =====================================================================
     report.append("\n" + "-" * 80)
-    report.append("DETAILED RESULTS (Mean across all windows and SKUs)")
+    report.append("FORECAST QUALITY (Mean across all windows and SKUs)")
+    report.append("-" * 80)
+    report.append("  All methods use Random Forest as base predictor (equalized architecture)")
+
+    fq_header = f"{'Method':<25} {'Coverage':>10} {'IntWidth':>10} {'MAE':>10} {'RMSE':>10} {'MAPE(%)':>10}"
+    report.append(f"\n{fq_header}")
+    report.append("-" * len(fq_header))
+
+    for method in existing_methods:
+        m_df = combined_df[combined_df['Method'] == method]
+        cov = m_df['Coverage'].mean() if 'Coverage' in m_df.columns else np.nan
+        iw = m_df['Avg_Interval_Width'].mean() if 'Avg_Interval_Width' in m_df.columns else np.nan
+        mae = m_df['MAE'].mean() if 'MAE' in m_df.columns else np.nan
+        rmse = m_df['RMSE'].mean() if 'RMSE' in m_df.columns else np.nan
+        mape = m_df['MAPE'].mean() if 'MAPE' in m_df.columns else np.nan
+        cov_str = f"{cov*100:>9.1f}%" if not np.isnan(cov) else f"{'N/A':>10}"
+        iw_str = f"{iw:>10.2f}" if not np.isnan(iw) else f"{'N/A':>10}"
+        report.append(
+            f"{get_model_display_name(method):<25} "
+            f"{cov_str} "
+            f"{iw_str} "
+            f"{mae:>10.2f} "
+            f"{rmse:>10.2f} "
+            f"{mape:>9.1f}%"
+        )
+
+    # =====================================================================
+    # DECISION QUALITY (separate from forecast quality)
+    # =====================================================================
+    report.append("\n" + "-" * 80)
+    report.append("DECISION QUALITY (Mean across all windows and SKUs)")
     report.append("-" * 80)
 
     header = f"{'Method':<25} {'Mean Cost':>10} {'CVaR-90':>10} {'CVaR-95':>10} {'SL (%)':>8} {'Cap Util':>10} {'Carryover':>10} {'Time(s)':>8}"
@@ -1315,7 +1497,7 @@ def compute_statistical_tests(
                        f"Using first non-oracle method.")
         reference_method = [m for m in existing_methods if m != 'Seer'][0]
 
-    test_metrics = ['Mean_Cost', 'CVaR_90', 'CVaR_95', 'Service_Level']
+    test_metrics = ['RMSE', 'Coverage', 'Mean_Cost', 'CVaR_90', 'CVaR_95', 'Service_Level']
     comparison_methods = [m for m in existing_methods if m != reference_method]
 
     # Number of comparisons for Bonferroni correction
@@ -1384,10 +1566,10 @@ def compute_statistical_tests(
             else:
                 effect_interp = "large"
 
-            # For cost metrics, negative diff means reference is better (lower cost)
-            # For service level, positive diff means reference is better (higher SL)
-            is_cost_metric = metric in ['Mean_Cost', 'CVaR_90', 'CVaR_95']
-            ref_better = np.mean(diff) < 0 if is_cost_metric else np.mean(diff) > 0
+            # For cost/error metrics, negative diff means reference is better (lower)
+            # For service level/coverage, positive diff means reference is better (higher)
+            is_lower_better = metric in ['Mean_Cost', 'CVaR_90', 'CVaR_95', 'RMSE']
+            ref_better = np.mean(diff) < 0 if is_lower_better else np.mean(diff) > 0
 
             stat_results.append({
                 'Metric': metric,
@@ -1579,7 +1761,8 @@ def main(
 
     logger.info("=" * 80)
     logger.info("INVENTORY OPTIMIZATION WITH CARRYOVER & CAPACITY CONSTRAINTS")
-    logger.info("6-Model Comparison: SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO, Seer")
+    logger.info("6-Model Comparison: SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO(RF), Seer")
+    logger.info("All methods use Random Forest base predictor (equalized architecture)")
     logger.info("=" * 80)
     logger.info(f"Stores: {store_ids}")
     logger.info(f"Items: {item_ids}")
@@ -1646,7 +1829,8 @@ def main(
     combined_df = pd.concat(all_results, ignore_index=True)
 
     # Compute aggregated statistics
-    agg_metrics = ['Mean_Cost', 'CVaR_90', 'CVaR_95', 'Service_Level',
+    agg_metrics = ['Coverage', 'Avg_Interval_Width', 'MAE', 'RMSE', 'MAPE',
+                   'Mean_Cost', 'CVaR_90', 'CVaR_95', 'Service_Level',
                    'Avg_Carryover', 'Avg_Capacity_Util',
                    'Total_Ordering_Cost', 'Total_Holding_Cost', 'Total_Stockout_Cost',
                    'Time_Seconds']
@@ -1722,10 +1906,6 @@ if __name__ == "__main__":
         "--data", type=str, default="train.csv",
         help="Path to data file"
     )
-    parser.add_argument(
-        "--spo-epochs", type=int, default=50,
-        help="Training epochs for SPO model"
-    )
     # Inventory dynamics arguments
     parser.add_argument(
         "--carryover", type=float, default=0.95,
@@ -1762,9 +1942,6 @@ if __name__ == "__main__":
     config.results_dir = args.output
     config.rolling_window.enabled = True
     config.data.filepath = args.data
-
-    # Set SPO epochs
-    config._spo_epochs = args.spo_epochs
 
     # Set inventory dynamics
     config.cost.carryover_rate = args.carryover
