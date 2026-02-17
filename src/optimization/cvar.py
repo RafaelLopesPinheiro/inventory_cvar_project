@@ -12,7 +12,7 @@ References:
 """
 
 import numpy as np
-from scipy.optimize import minimize
+import pulp
 from typing import Tuple, Optional
 from dataclasses import dataclass
 import logging
@@ -83,11 +83,18 @@ def optimize_cvar_single(
     stockout_cost: float = 50.0
 ) -> float:
     """
-    Optimize order quantity using CVaR via Rockafellar-Uryasev formulation.
-    
-    The formulation is:
-        min_{q, τ} τ + (1 / (N * (1 - β))) * Σ max(0, Loss(q, d_i) - τ)
-    
+    Optimize order quantity using CVaR via Rockafellar-Uryasev LP formulation.
+
+    Reformulates the CVaR minimization as a Linear Program (LP):
+
+        min_{q, τ, h_i, u_i, z_i}  τ + (1 / (N * (1 - β))) * Σ z_i
+
+        s.t.  h_i >= q - d_i          (overage linearization)
+              u_i >= d_i - q          (underage linearization)
+              z_i >= c_o*q + c_h*h_i + c_u*u_i - τ  (CVaR slack)
+              h_i, u_i, z_i >= 0
+              q >= 0
+
     Parameters
     ----------
     demand_samples : np.ndarray
@@ -96,40 +103,39 @@ def optimize_cvar_single(
         CVaR level (tail probability).
     ordering_cost, holding_cost, stockout_cost : float
         Cost parameters.
-        
+
     Returns
     -------
     float
         Optimal order quantity.
     """
-    n_samples = len(demand_samples)
-    
-    def cvar_objective(x: np.ndarray) -> float:
-        q, tau = x
-        losses = newsvendor_loss(
-            q, demand_samples,
-            ordering_cost, holding_cost, stockout_cost
-        )
-        cvar_term = tau + (1 / (n_samples * (1 - beta))) * np.sum(
-            np.maximum(0, losses - tau)
-        )
-        return cvar_term
-    
-    # Initial guess
-    q0 = np.mean(demand_samples)
-    tau0 = np.median(newsvendor_loss(q0, demand_samples, ordering_cost, holding_cost, stockout_cost))
-    
-    # Bounds: q >= 0, tau unrestricted
-    bounds = [(0, None), (None, None)]
-    
-    result = minimize(
-        cvar_objective,
-        [q0, tau0],
-        method='L-BFGS-B',
-        bounds=bounds
-    )
-    
-    return max(0, result.x[0])
+    n = len(demand_samples)
+    c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
+
+    prob = pulp.LpProblem("CVaR_Newsvendor", pulp.LpMinimize)
+
+    q = pulp.LpVariable("q", lowBound=0)
+    tau = pulp.LpVariable("tau")
+
+    # Linearization variables for each demand scenario
+    h = [pulp.LpVariable(f"h_{i}", lowBound=0) for i in range(n)]  # overage
+    u = [pulp.LpVariable(f"u_{i}", lowBound=0) for i in range(n)]  # underage
+    z = [pulp.LpVariable(f"z_{i}", lowBound=0) for i in range(n)]  # CVaR slack
+
+    # Objective: τ + (1 / (N * (1 - β))) * Σ z_i
+    prob += tau + (1.0 / (n * (1.0 - beta))) * pulp.lpSum(z)
+
+    # Constraints for each demand scenario
+    for i in range(n):
+        d_i = float(demand_samples[i])
+        prob += h[i] >= q - d_i                                      # h_i >= q - d_i
+        prob += u[i] >= d_i - q                                      # u_i >= d_i - q
+        prob += z[i] >= c_o * q + c_h * h[i] + c_u * u[i] - tau    # z_i >= Loss_i - τ
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+    q_val = pulp.value(q)
+    return max(0.0, q_val if q_val is not None else 0.0)
 
 
 def _optimize_cvar_single_worker(args):
@@ -226,7 +232,7 @@ def compute_order_quantities_cvar(
         for i in range(n_days)
     ]
 
-    # Use ThreadPoolExecutor (faster for I/O bound scipy.optimize)
+    # Use ThreadPoolExecutor for parallel LP solves
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         order_quantities = list(executor.map(_optimize_cvar_single_worker, args_list))
 
@@ -277,18 +283,21 @@ def optimize_wasserstein_dro_single(
     Optimize order quantity using Wasserstein Distributionally Robust Optimization.
 
     Solves the worst-case CVaR over all distributions within an epsilon-Wasserstein
-    ball centered at the empirical distribution.
+    ball centered at the empirical distribution, via a Linear Program (LP).
 
     The formulation is:
         min_q max_{P: W(P, P̂) ≤ ε} CVaR_β(Loss(q, D))
 
-    For the newsvendor problem with Wasserstein ambiguity, this can be reformulated as:
-        min_{q, λ≥0} λε + (1/N) Σ sup_{d} [ℓ_β(q, d) - λ|d - d̂_i|]
+    For the newsvendor problem with Wasserstein ambiguity, this is solved as:
 
-    where ℓ_β is the CVaR-transformed loss.
+        min_{q, λ, τ, r_u, r_h, wc_i, z_i}  λε + τ + (1/(N(1-β))) Σ z_i
 
-    For tractability, we use a conservative approximation that adds a robustness
-    margin based on the Wasserstein radius and the Lipschitz constant of the loss.
+        s.t.  r_u >= c_u - λ                               (adversarial gain, stockout side)
+              r_h >= c_h - λ                               (adversarial gain, overage side)
+              wc_i >= (c_o - c_u)*q + c_u*d̂_i + ε*r_u    (worst-case loss, stockout)
+              wc_i >= (c_o + c_h)*q - c_h*d̂_i + ε*r_h    (worst-case loss, overage)
+              z_i  >= wc_i - τ                             (CVaR slack)
+              q, λ, r_u, r_h, wc_i, z_i >= 0
 
     Parameters
     ----------
@@ -316,92 +325,45 @@ def optimize_wasserstein_dro_single(
     - Gao & Kleywegt (2022) "Distributionally Robust Stochastic Optimization
       with Wasserstein Distance"
     """
-    n_samples = len(demand_samples)
+    n = len(demand_samples)
+    c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
+    lipschitz_constant = max(c_h, c_u)
 
-    # Lipschitz constant of the newsvendor loss with respect to demand
-    # L(q, d) = c_o*q + c_h*max(0, q-d) + c_u*max(0, d-q)
-    # |∂L/∂d| ≤ max(c_h, c_u) = c_u (since c_u > c_h typically)
-    lipschitz_constant = max(holding_cost, stockout_cost)
+    prob = pulp.LpProblem("DRO_Newsvendor", pulp.LpMinimize)
 
-    def dro_objective(x: np.ndarray) -> float:
-        """
-        Wasserstein DRO objective with CVaR.
+    q = pulp.LpVariable("q", lowBound=0)
+    lam = pulp.LpVariable("lam", lowBound=0, upBound=lipschitz_constant)
+    tau = pulp.LpVariable("tau")
 
-        Uses the dual formulation:
-        min_{q, λ, τ} λε + τ + (1/(N(1-β))) Σ max(0, sup_d[Loss(q,d) - λ|d-d̂_i|] - τ)
-        """
-        q, lam, tau = x
+    # r_u = max(0, c_u - λ): adversarial gain on stockout side
+    # r_h = max(0, c_h - λ): adversarial gain on overage side
+    r_u = pulp.LpVariable("r_u", lowBound=0)
+    r_h = pulp.LpVariable("r_h", lowBound=0)
 
-        if lam < 0:
-            return 1e10  # Penalty for negative lambda
+    # Per-scenario worst-case loss and CVaR slack
+    wc = [pulp.LpVariable(f"wc_{i}", lowBound=0) for i in range(n)]
+    z = [pulp.LpVariable(f"z_{i}", lowBound=0) for i in range(n)]
 
-        # For each empirical sample, compute the worst-case contribution
-        # The supremum over d of [Loss(q,d) - λ|d-d̂_i|] depends on the structure
-        # of the loss function.
+    # Objective: λε + τ + (1/(N*(1-β))) * Σ z_i
+    prob += lam * epsilon + tau + (1.0 / (n * (1.0 - beta))) * pulp.lpSum(z)
 
-        # For newsvendor loss, the worst case can be computed analytically:
-        # If λ ≥ c_u: worst case is at d = d̂_i (no adversarial shift)
-        # If λ < c_u: adversary can shift demand to maximize loss
+    # Adversarial gain linearization
+    prob += r_u >= c_u - lam   # r_u >= c_u - λ
+    prob += r_h >= c_h - lam   # r_h >= c_h - λ
 
-        worst_case_losses = np.zeros(n_samples)
+    for i in range(n):
+        d_hat = float(demand_samples[i])
+        # Worst-case loss from stockout side (adversary increases demand)
+        prob += wc[i] >= (c_o - c_u) * q + c_u * d_hat + epsilon * r_u
+        # Worst-case loss from overage side (adversary decreases demand)
+        prob += wc[i] >= (c_o + c_h) * q - c_h * d_hat + epsilon * r_h
+        # CVaR slack: z_i >= wc_i - τ
+        prob += z[i] >= wc[i] - tau
 
-        for i, d_hat in enumerate(demand_samples):
-            if lam >= lipschitz_constant:
-                # Adversary is too expensive, use empirical sample
-                worst_case_losses[i] = newsvendor_loss(
-                    q, np.array([d_hat]),
-                    ordering_cost, holding_cost, stockout_cost
-                )[0]
-            else:
-                # Adversary shifts demand to worst direction
-                # For q > d̂: adversary decreases demand (more overage)
-                # For q < d̂: adversary increases demand (more stockout)
+    prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
-                # Compute loss at empirical point
-                base_loss = newsvendor_loss(
-                    q, np.array([d_hat]),
-                    ordering_cost, holding_cost, stockout_cost
-                )[0]
-
-                # Add worst-case margin based on effective adversarial power
-                # The adversary can gain (c_u - λ) per unit of demand shift for stockouts
-                # or (c_h - λ) per unit for overage (if λ < c_h)
-
-                if q <= d_hat:
-                    # Currently in stockout region, adversary increases demand
-                    marginal_gain = stockout_cost - lam
-                else:
-                    # Currently in overage region, adversary decreases demand
-                    marginal_gain = holding_cost - lam if lam < holding_cost else 0
-
-                # Worst-case adds margin proportional to epsilon and marginal gain
-                # (bounded by how much the adversary can shift within epsilon budget)
-                worst_case_losses[i] = base_loss + max(0, marginal_gain) * epsilon
-
-        # CVaR computation over worst-case losses
-        cvar_term = tau + (1 / (n_samples * (1 - beta))) * np.sum(
-            np.maximum(0, worst_case_losses - tau)
-        )
-
-        # Add Wasserstein penalty term
-        return lam * epsilon + cvar_term
-
-    # Initial guess
-    q0 = np.mean(demand_samples)
-    lam0 = lipschitz_constant  # Start at Lipschitz constant
-    tau0 = np.median(newsvendor_loss(q0, demand_samples, ordering_cost, holding_cost, stockout_cost))
-
-    # Bounds: q >= 0, lambda >= 0, tau unrestricted
-    bounds = [(0, None), (0, None), (None, None)]
-
-    result = minimize(
-        dro_objective,
-        [q0, lam0, tau0],
-        method='L-BFGS-B',
-        bounds=bounds
-    )
-
-    return max(0, result.x[0])
+    q_val = pulp.value(q)
+    return max(0.0, q_val if q_val is not None else 0.0)
 
 
 def _optimize_dro_single_worker(args):
@@ -664,40 +626,60 @@ def optimize_multi_period_cvar_single(
     n_scenarios = len(demand_samples[horizons[0]])
 
     if joint_optimization:
-        # Optimize single order quantity for all horizons
-        def cvar_objective(x: np.ndarray) -> float:
-            q, tau = x
-            q_arr = np.full(n_scenarios, q)
+        # Optimize single order quantity for all horizons via LP
+        # Variables: q, τ, h_{i,h}, u_{i,h} (per scenario per horizon), z_i (per scenario)
+        n_horizons = len(horizons)
+        c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
 
-            # Create demand dict with repeated values for vectorization
-            d_scenarios = {h: demand_samples[h] for h in horizons}
+        prob = pulp.LpProblem("MultiPeriod_CVaR_Newsvendor", pulp.LpMinimize)
 
-            losses = multi_period_newsvendor_loss(
-                q_arr, d_scenarios, horizons,
-                ordering_cost, holding_cost, stockout_cost,
-                aggregation
-            )
+        q = pulp.LpVariable("q", lowBound=0)
+        tau = pulp.LpVariable("tau")
+        z = [pulp.LpVariable(f"z_{i}", lowBound=0) for i in range(n_scenarios)]
 
-            cvar_term = tau + (1 / (n_scenarios * (1 - beta))) * np.sum(
-                np.maximum(0, losses - tau)
-            )
-            return cvar_term
+        # Per-scenario, per-horizon linearization variables
+        h = {(i, h_idx): pulp.LpVariable(f"h_{i}_{h_idx}", lowBound=0)
+             for i in range(n_scenarios) for h_idx in range(n_horizons)}
+        u = {(i, h_idx): pulp.LpVariable(f"u_{i}_{h_idx}", lowBound=0)
+             for i in range(n_scenarios) for h_idx in range(n_horizons)}
 
-        # Initial guess based on mean demand across horizons
-        mean_demands = [np.mean(demand_samples[h]) for h in horizons]
-        q0 = np.mean(mean_demands)
-        tau0 = 0.0
+        # Objective: τ + (1/(N*(1-β))) * Σ z_i
+        prob += tau + (1.0 / (n_scenarios * (1.0 - beta))) * pulp.lpSum(z)
 
-        bounds = [(0, None), (None, None)]
+        for i in range(n_scenarios):
+            if aggregation == "worst_case":
+                # Need per-horizon loss variables for worst-case
+                w = [pulp.LpVariable(f"w_{i}_{h_idx}", lowBound=0)
+                     for h_idx in range(n_horizons)]
+                for h_idx, horizon in enumerate(horizons):
+                    d_ih = float(demand_samples[horizon][i])
+                    prob += h[i, h_idx] >= q - d_ih
+                    prob += u[i, h_idx] >= d_ih - q
+                    # w_{i,h} >= L(q, d_{i,h})
+                    prob += w[h_idx] >= c_o * q + c_h * h[i, h_idx] + c_u * u[i, h_idx]
+                # z_i >= max_h L_ih - τ  (i.e. z_i >= w_{i,h} - τ for all h)
+                for h_idx in range(n_horizons):
+                    prob += z[i] >= w[h_idx] - tau
+            else:
+                # mean or sum aggregation: build aggregated loss expression
+                agg_loss_expr = pulp.lpSum(
+                    c_o * q + c_h * h[i, h_idx] + c_u * u[i, h_idx]
+                    for h_idx in range(n_horizons)
+                )
+                if aggregation == "mean":
+                    agg_loss_expr = agg_loss_expr / n_horizons
 
-        result = minimize(
-            cvar_objective,
-            [q0, tau0],
-            method='L-BFGS-B',
-            bounds=bounds
-        )
+                for h_idx, horizon in enumerate(horizons):
+                    d_ih = float(demand_samples[horizon][i])
+                    prob += h[i, h_idx] >= q - d_ih
+                    prob += u[i, h_idx] >= d_ih - q
 
-        return max(0, result.x[0])
+                prob += z[i] >= agg_loss_expr - tau
+
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+        q_val = pulp.value(q)
+        return max(0.0, q_val if q_val is not None else 0.0)
 
     else:
         # Optimize separately for each horizon

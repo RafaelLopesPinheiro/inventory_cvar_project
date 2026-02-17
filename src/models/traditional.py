@@ -22,7 +22,7 @@ References:
 
 import numpy as np
 from scipy import stats
-from scipy.optimize import minimize, linprog
+from ..optimization.cvar import optimize_cvar_single, optimize_wasserstein_dro_single
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from typing import Optional, List, Tuple, Set
 import logging
@@ -570,16 +570,11 @@ class TwoStageStochastic(BaseForecaster):
             return cvar_term
 
         if self.use_cvar:
-            # CVaR optimization
-            q0 = np.mean(scenarios)
-            tau0 = np.median(scenarios) * self.ordering_cost
-            result = minimize(
-                cvar_objective,
-                [q0, tau0],
-                method='L-BFGS-B',
-                bounds=[(0, None), (None, None)]
+            # CVaR optimization via PuLP LP
+            q_optimal = optimize_cvar_single(
+                scenarios, self.cvar_beta,
+                self.ordering_cost, self.holding_cost, self.stockout_cost
             )
-            q_optimal = max(0, result.x[0])
         else:
             # Expected cost optimization
             # Analytical solution: critical quantile
@@ -1766,68 +1761,10 @@ class DistributionallyRobustOptimization(BaseForecaster):
         float
             Optimal robust order quantity.
         """
-        n_samples = len(demand_samples)
-
-        # Lipschitz constant of newsvendor loss w.r.t. demand
-        lipschitz_constant = max(self.holding_cost, self.stockout_cost)
-
-        def newsvendor_loss_single(q: float, d: float) -> float:
-            """Single-sample newsvendor loss."""
-            overage = max(0, q - d)
-            underage = max(0, d - q)
-            return (self.ordering_cost * q +
-                    self.holding_cost * overage +
-                    self.stockout_cost * underage)
-
-        def dro_objective(x: np.ndarray) -> float:
-            """Wasserstein DRO objective with CVaR."""
-            q, lam, tau = x
-
-            if lam < 0:
-                return 1e10
-
-            worst_case_losses = np.zeros(n_samples)
-
-            for i, d_hat in enumerate(demand_samples):
-                if lam >= lipschitz_constant:
-                    # Adversary is too expensive, use empirical sample
-                    worst_case_losses[i] = newsvendor_loss_single(q, d_hat)
-                else:
-                    # Compute base loss at empirical point
-                    base_loss = newsvendor_loss_single(q, d_hat)
-
-                    # Add worst-case margin
-                    if q <= d_hat:
-                        marginal_gain = self.stockout_cost - lam
-                    else:
-                        marginal_gain = (self.holding_cost - lam
-                                        if lam < self.holding_cost else 0)
-
-                    worst_case_losses[i] = base_loss + max(0, marginal_gain) * epsilon
-
-            # CVaR over worst-case losses
-            cvar_term = tau + (1 / (n_samples * (1 - self.cvar_beta))) * np.sum(
-                np.maximum(0, worst_case_losses - tau)
-            )
-
-            return lam * epsilon + cvar_term
-
-        # Initial guess
-        q0 = np.mean(demand_samples)
-        lam0 = lipschitz_constant
-        tau0 = np.median([newsvendor_loss_single(q0, d) for d in demand_samples])
-
-        # Bounds
-        bounds = [(0, None), (0, None), (None, None)]
-
-        result = minimize(
-            dro_objective,
-            [q0, lam0, tau0],
-            method='L-BFGS-B',
-            bounds=bounds
+        return optimize_wasserstein_dro_single(
+            demand_samples, epsilon, self.cvar_beta,
+            self.ordering_cost, self.holding_cost, self.stockout_cost
         )
-
-        return max(0, result.x[0])
 
     def get_params(self) -> dict:
         """Get model parameters."""
@@ -1995,37 +1932,10 @@ class SPORandomForest(BaseForecaster):
 
         where Loss(q, d) = c_o*q + c_h*max(0, q-d) + c_u*max(0, d-q)
         """
-        n = len(demand_scenarios)
-        c_o = self.ordering_cost
-        c_h = self.holding_cost
-        c_u = self.stockout_cost
-        beta = self.cvar_beta
-
-        def cvar_objective(x):
-            q, tau = x
-            overage = np.maximum(0, q - demand_scenarios)
-            underage = np.maximum(0, demand_scenarios - q)
-            losses = c_o * q + c_h * overage + c_u * underage
-            excess = np.maximum(0, losses - tau)
-            return tau + (1.0 / (n * (1.0 - beta))) * np.sum(excess)
-
-        # Initial guess: critical quantile
-        critical_ratio = c_u / (c_u + c_h)
-        q0 = np.quantile(demand_scenarios, critical_ratio)
-        tau0 = float(np.median(
-            c_o * q0
-            + c_h * np.maximum(0, q0 - demand_scenarios)
-            + c_u * np.maximum(0, demand_scenarios - q0)
-        ))
-
-        result = minimize(
-            cvar_objective,
-            [q0, tau0],
-            method='L-BFGS-B',
-            bounds=[(0, None), (None, None)],
+        return optimize_cvar_single(
+            demand_scenarios, self.cvar_beta,
+            self.ordering_cost, self.holding_cost, self.stockout_cost
         )
-
-        return max(0.0, result.x[0])
 
 
 class Seer(BaseForecaster):
