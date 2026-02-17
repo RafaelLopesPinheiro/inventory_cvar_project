@@ -97,6 +97,7 @@ from src.optimization import (
     compute_order_quantities_cvar,
     CostParameters,
     simulate_inventory_with_carryover,
+    simulate_sS_policy_with_carryover,
     InventorySimulationResult,
 )
 from src.evaluation import (
@@ -121,6 +122,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 MODEL_CATEGORIES = {
+    "0_SimplePolicy": ["sS_Policy"],
     "1_OR_Standard": ["SAA"],
     "2_DistributionFree": ["Conformal_CVaR"],
     "3_RobustOptimization": ["Wasserstein_DRO"],
@@ -129,9 +131,10 @@ MODEL_CATEGORIES = {
     "6_Oracle": ["Seer"],
 }
 
-MODEL_ORDER = ['SAA', 'Conformal_CVaR', 'Wasserstein_DRO', 'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'Seer']
+MODEL_ORDER = ['sS_Policy', 'SAA', 'Conformal_CVaR', 'Wasserstein_DRO', 'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'Seer']
 
 MODEL_DISPLAY_NAMES = {
+    "sS_Policy": "0. (s,S) Policy",
     "SAA": "1. SAA",
     "Conformal_CVaR": "2. Conformal + CVaR",
     "Wasserstein_DRO": "3. Wasserstein DRO",
@@ -141,6 +144,7 @@ MODEL_DISPLAY_NAMES = {
 }
 
 MODEL_COLORS = {
+    "sS_Policy": "#8c564b",
     "SAA": "#1f77b4",
     "Conformal_CVaR": "#ff7f0e",
     "Wasserstein_DRO": "#9467bd",
@@ -266,14 +270,25 @@ def run_single_window(
     config: ExperimentConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, InventorySimulationResult]]:
     """
-    Run all 6 models on a single expanding window with carryover and capacity.
+    Run all 7 models on a single expanding window with carryover and capacity.
 
     Reports both forecast quality (coverage, interval width, RMSE) and
     decision quality (cost, CVaR, service level) independently, so reviewers
     can see where gains come from.
 
-    All methods use Random Forest as the base predictor for fair comparison
-    (equalizing the model architecture effect).
+    Method hierarchy:
+      0. (s,S) Policy   - Simple reorder rule, no forecasting (practical benchmark)
+      1. SAA            - OR baseline with ML point forecast
+      2. Conformal+CVaR - Distribution-free PI + CVaR optimisation
+      3. Wasserstein DRO- Robust optimisation within Wasserstein ball
+      4. EnbPI+CQR+CVaR - Ensemble PI + conformalized quantile regression + CVaR
+      5. SPO (RF,CVaR)  - Decision-focused predict-then-optimise
+      6. Seer           - Oracle upper bound (perfect foresight)
+
+    Methods 1–5 use Random Forest as the base predictor for a fair comparison
+    (equalising the model-architecture effect vs. optimisation method).  The
+    gap between (s,S) and the optimised methods directly quantifies the
+    value gained from combining demand forecasting with stochastic optimisation.
 
     Parameters
     ----------
@@ -295,6 +310,62 @@ def run_single_window(
     X_train, y_train = window_split.train.X, window_split.train.y
     X_cal, y_cal = window_split.calibration.X, window_split.calibration.y
     X_test, y_test = window_split.test.X, window_split.test.y
+
+    # =========================================================================
+    # 0. (s, S) POLICY (SIMPLE REORDER BENCHMARK — NO FORECASTING)
+    # =========================================================================
+    # This method requires no ML model.  It calibrates two fixed thresholds
+    # from the historical (training + calibration) demand distribution:
+    #   s  = demand quantile at the critical ratio  (reorder point)
+    #   S  = demand quantile just above s            (order-up-to level)
+    # At every test period the policy checks the current inventory:
+    #   if inventory <= s  →  order up to S
+    #   otherwise          →  do not order
+    # The gap between (s,S) and the optimisation methods directly quantifies
+    # the gain from demand forecasting + stochastic optimisation.
+    try:
+        start_time = time.time()
+
+        # Calibrate thresholds from historical demand
+        historical_demand = np.concatenate([y_train, y_cal])
+        critical_ratio = costs.stockout_cost / (costs.stockout_cost + costs.holding_cost)
+
+        # s: reorder point — demand level at the critical-ratio quantile
+        s_param = float(np.quantile(historical_demand, critical_ratio))
+        # S: order-up-to level — demand level at a high quantile (capped at 0.99)
+        S_quantile = min(0.99, critical_ratio + (1.0 - critical_ratio) * 0.5)
+        S_param = float(np.quantile(historical_demand, S_quantile))
+        # Ensure S > s with a meaningful margin
+        S_param = max(S_param, s_param * 1.05 + 1.0)
+
+        sS_sim = simulate_sS_policy_with_carryover(
+            y_test,
+            s=s_param,
+            S=S_param,
+            initial_inventory=costs.initial_inventory,
+            carryover_rate=costs.carryover_rate,
+            capacity=costs.capacity,
+            ordering_cost=costs.ordering_cost,
+            holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost
+        )
+
+        # (s,S) produces no probabilistic forecast; use the reorder point as a
+        # constant point prediction so downstream metrics degrade gracefully.
+        sS_pred = PredictionResult(
+            point=np.full(len(y_test), s_param),
+            lower=None,
+            upper=None
+        )
+
+        timings["sS_Policy"] = time.time() - start_time
+        sim_results["sS_Policy"] = sS_sim
+        results["sS_Policy"] = {
+            'pred': sS_pred, 'target_orders': sS_sim.actual_orders,
+            'sim': sS_sim, 'time': timings["sS_Policy"]
+        }
+    except Exception as e:
+        logger.debug(f"(s,S) Policy failed: {e}")
 
     # =========================================================================
     # 1. SAA (SAMPLE AVERAGE APPROXIMATION)
@@ -1370,6 +1441,72 @@ def create_summary_report(
         report.append(f"  Capacity Util:       {spo_df['Avg_Capacity_Util'].mean()*100:.1f}%")
         report.append(f"  Avg Carryover:       {spo_df['Avg_Carryover'].mean():.1f} units")
 
+    # (s,S) policy — simple reorder benchmark
+    if 'sS_Policy' in combined_df['Method'].values:
+        sS_df = combined_df[combined_df['Method'] == 'sS_Policy']
+        sS_mean_cost = sS_df['Mean_Cost'].mean()
+        sS_cvar90 = sS_df['CVaR_90'].mean()
+        report.append(f"\n[(s,S) POLICY — SIMPLE REORDER BENCHMARK]")
+        report.append(f"  Mean Cost:           ${sS_mean_cost:.2f}  (no forecasting / no optimisation)")
+        report.append(f"  CVaR-90:             ${sS_cvar90:.2f}")
+        report.append(f"  Service Level:       {sS_df['Service_Level'].mean()*100:.1f}%")
+        report.append(f"  Capacity Util:       {sS_df['Avg_Capacity_Util'].mean()*100:.1f}%")
+        report.append(f"  Avg Carryover:       {sS_df['Avg_Carryover'].mean():.1f} units")
+
+    # =====================================================================
+    # VALUE OF OPTIMISATION: improvement of each method over (s,S) policy
+    # =====================================================================
+    if 'sS_Policy' in combined_df['Method'].values:
+        report.append("\n" + "-" * 80)
+        report.append("VALUE OF OPTIMISATION: gain vs. (s,S) simple policy")
+        report.append("(positive = lower cost = better; quantifies gain from forecasting+optimisation)")
+        report.append("-" * 80)
+
+        sS_mean_cost = combined_df[combined_df['Method'] == 'sS_Policy']['Mean_Cost'].mean()
+        sS_cvar90   = combined_df[combined_df['Method'] == 'sS_Policy']['CVaR_90'].mean()
+        sS_cvar95   = combined_df[combined_df['Method'] == 'sS_Policy']['CVaR_95'].mean()
+        sS_sl       = combined_df[combined_df['Method'] == 'sS_Policy']['Service_Level'].mean()
+
+        voo_header = (
+            f"{'Method':<25} "
+            f"{'Cost Saving ($)':>16} {'Cost Saving (%)':>16} "
+            f"{'CVaR-90 Red ($)':>16} {'CVaR-90 Red (%)':>16} "
+            f"{'SL Delta (pp)':>14}"
+        )
+        report.append(f"\n{voo_header}")
+        report.append("-" * len(voo_header))
+
+        for method in existing_methods:
+            if method in ('sS_Policy', 'Seer'):
+                continue
+            m_df = combined_df[combined_df['Method'] == method]
+            m_cost   = m_df['Mean_Cost'].mean()
+            m_cvar90 = m_df['CVaR_90'].mean()
+            m_sl     = m_df['Service_Level'].mean()
+
+            cost_saving_abs  = sS_mean_cost - m_cost
+            cost_saving_pct  = cost_saving_abs / sS_mean_cost * 100 if sS_mean_cost != 0 else 0.0
+            cvar90_red_abs   = sS_cvar90 - m_cvar90
+            cvar90_red_pct   = cvar90_red_abs / sS_cvar90 * 100 if sS_cvar90 != 0 else 0.0
+            sl_delta_pp      = (m_sl - sS_sl) * 100
+
+            report.append(
+                f"{get_model_display_name(method):<25} "
+                f"{cost_saving_abs:>+15.2f}  "
+                f"{cost_saving_pct:>+15.1f}% "
+                f"{cvar90_red_abs:>+15.2f}  "
+                f"{cvar90_red_pct:>+15.1f}% "
+                f"{sl_delta_pp:>+13.1f}pp"
+            )
+
+        # Oracle gap analysis
+        if 'Seer' in combined_df['Method'].values:
+            seer_cost = combined_df[combined_df['Method'] == 'Seer']['Mean_Cost'].mean()
+            report.append(f"\n  Oracle (Seer) cost:   ${seer_cost:.2f}  "
+                          f"(= theoretical lower bound; gap to (s,S): "
+                          f"${sS_mean_cost - seer_cost:.2f} / "
+                          f"{(sS_mean_cost - seer_cost)/sS_mean_cost*100:.1f}%)")
+
     # =====================================================================
     # FORECAST QUALITY (separate from decision quality)
     # =====================================================================
@@ -1761,8 +1898,9 @@ def main(
 
     logger.info("=" * 80)
     logger.info("INVENTORY OPTIMIZATION WITH CARRYOVER & CAPACITY CONSTRAINTS")
-    logger.info("6-Model Comparison: SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO(RF), Seer")
-    logger.info("All methods use Random Forest base predictor (equalized architecture)")
+    logger.info("7-Model Comparison: (s,S) Policy, SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO(RF), Seer")
+    logger.info("Methods 1-5 use Random Forest base predictor (equalized architecture)")
+    logger.info("(s,S) Policy is a rule-based benchmark requiring no forecasting model")
     logger.info("=" * 80)
     logger.info(f"Stores: {store_ids}")
     logger.info(f"Items: {item_ids}")
