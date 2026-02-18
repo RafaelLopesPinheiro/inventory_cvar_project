@@ -170,7 +170,7 @@ def get_model_display_name(method_name: str) -> str:
 
 
 # Module-level flag: can be set to False via --no-lstm CLI argument
-_ENABLE_LSTM: bool = True
+_ENABLE_LSTM = True
 
 
 # =============================================================================
@@ -2228,7 +2228,7 @@ if __name__ == "__main__":
     item_ids = parse_id_range(args.items)
 
     # Set module-level LSTM flag before any work starts
-    global _ENABLE_LSTM
+    
     _ENABLE_LSTM = not args.no_lstm
 
     config = get_default_config()
