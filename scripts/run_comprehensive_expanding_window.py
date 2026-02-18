@@ -170,7 +170,7 @@ def get_model_display_name(method_name: str) -> str:
 
 
 # Module-level flag: can be set to False via --no-lstm CLI argument
-_ENABLE_LSTM: bool = True
+_ENABLE_LSTM = True  # bool
 
 
 # =============================================================================
