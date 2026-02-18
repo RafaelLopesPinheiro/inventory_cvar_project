@@ -2,7 +2,7 @@
 """
 Comprehensive Multi-SKU Expanding Window Experiment with Inventory Dynamics
 
-This script compares 6 forecasting/optimization methods for inventory management
+This script compares 7 forecasting/optimization methods for inventory management
 using expanding window cross-validation, enriched with carryover and capacity
 constraints that model realistic warehouse operations.
 
@@ -13,17 +13,20 @@ Unlike the standard single-period newsvendor, this experiment models:
 - Capacity: Warehouse has a maximum storage limit
 - Sequential decisions: Each period's order depends on current inventory state
 
-MODEL HIERARCHY (6 Methods):
-=============================
-All methods use Random Forest as the base predictor to equalize the effect of
-model architecture vs. the uncertainty/optimization method.
+MODEL HIERARCHY (7 Methods + simple policy benchmark):
+=======================================================
+Methods 1-5 use Random Forest as the base predictor to equalize the effect of
+model architecture vs. the uncertainty/optimization method.  Method 6 uses an
+LSTM neural network to assess the benefit of deep sequence modelling.
 
+0. (s,S) Policy        - Simple rule-based reorder benchmark (no forecasting)
 1. SAA                 - Sample Average Approximation (OR benchmark)
 2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
 3. Wasserstein DRO     - Distributionally Robust Optimization
 4. EnbPI + CQR + CVaR  - Ensemble Batch PI + Conformalized Quantile Regression + CVaR
 5. SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
-6. Seer               - Oracle upper bound (perfect foresight)
+6. LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
+7. Seer               - Oracle upper bound (perfect foresight)
 
 EVALUATION:
 ===========
@@ -91,6 +94,7 @@ from src.models import (
     DistributionallyRobustOptimization,
     SPORandomForest,
     Seer,
+    LSTMQuantileRegression,
     PredictionResult,
 )
 from src.optimization import (
@@ -128,10 +132,14 @@ MODEL_CATEGORIES = {
     "3_RobustOptimization": ["Wasserstein_DRO"],
     "4_YourContribution": ["EnbPI_CQR_CVaR"],
     "5_EndToEnd": ["SPO_EndToEnd"],
-    "6_Oracle": ["Seer"],
+    "6_DeepLearning": ["LSTM_Conformal_CVaR"],
+    "7_Oracle": ["Seer"],
 }
 
-MODEL_ORDER = ['sS_Policy', 'SAA', 'Conformal_CVaR', 'Wasserstein_DRO', 'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'Seer']
+MODEL_ORDER = [
+    'sS_Policy', 'SAA', 'Conformal_CVaR', 'Wasserstein_DRO',
+    'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'LSTM_Conformal_CVaR', 'Seer',
+]
 
 MODEL_DISPLAY_NAMES = {
     "sS_Policy": "0. (s,S) Policy",
@@ -140,7 +148,8 @@ MODEL_DISPLAY_NAMES = {
     "Wasserstein_DRO": "3. Wasserstein DRO",
     "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR",
     "SPO_EndToEnd": "5. SPO (RF, CVaR)",
-    "Seer": "6. Seer (Oracle)",
+    "LSTM_Conformal_CVaR": "6. LSTM+Conformal+CVaR",
+    "Seer": "7. Seer (Oracle)",
 }
 
 MODEL_COLORS = {
@@ -150,6 +159,7 @@ MODEL_COLORS = {
     "Wasserstein_DRO": "#9467bd",
     "EnbPI_CQR_CVaR": "#d62728",
     "SPO_EndToEnd": "#e377c2",
+    "LSTM_Conformal_CVaR": "#17becf",
     "Seer": "#2ca02c",
 }
 
@@ -157,6 +167,67 @@ MODEL_COLORS = {
 def get_model_display_name(method_name: str) -> str:
     """Get a clean display name for a method."""
     return MODEL_DISPLAY_NAMES.get(method_name, method_name)
+
+
+# Module-level flag: can be set to False via --no-lstm CLI argument
+_ENABLE_LSTM: bool = True
+
+
+# =============================================================================
+# SEQUENCE CREATION HELPER FOR LSTM
+# =============================================================================
+
+def _make_sequences(
+    X: np.ndarray,
+    seq_len: int,
+    X_context: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Convert a 2-D feature array into a 3-D sequence tensor for LSTM input.
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n, features)
+        Feature matrix ordered chronologically.
+    seq_len : int
+        Look-back window length.
+    X_context : np.ndarray or None
+        If provided, the last (seq_len-1) rows of this array are prepended as
+        history so that each of the n samples in X gets a full-length sequence.
+        When None (training mode) a sliding window is used instead and the
+        first (seq_len-1) rows of X are repeated as padding.
+
+    Returns
+    -------
+    np.ndarray, shape (m, seq_len, features)
+        When X_context is None  : m = max(1, n - seq_len + 1) sequences
+        When X_context supplied : m = n sequences (one per sample in X)
+    """
+    n, f = X.shape
+
+    if X_context is not None:
+        # ---------- calibration / test mode ----------
+        # Prepend the tail of the previous split to get exactly n sequences.
+        ctx_len = min(seq_len - 1, len(X_context))
+        context = X_context[-ctx_len:]
+        pad_len = seq_len - 1 - ctx_len
+        if pad_len > 0:
+            pad = np.repeat(X[:1], pad_len, axis=0)
+            X_full = np.vstack([pad, context, X])
+        else:
+            X_full = np.vstack([context, X])
+        return np.stack([X_full[i: i + seq_len] for i in range(n)])
+
+    else:
+        # ---------- training mode: sliding window ----------
+        if n < seq_len:
+            # Pad the beginning with the first row repeated
+            pad = np.repeat(X[:1], seq_len - n, axis=0)
+            X_full = np.vstack([pad, X])
+        else:
+            X_full = X
+        n_seq = len(X_full) - seq_len + 1
+        return np.stack([X_full[i: i + seq_len] for i in range(n_seq)])
 
 
 # =============================================================================
@@ -270,25 +341,28 @@ def run_single_window(
     config: ExperimentConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, InventorySimulationResult]]:
     """
-    Run all 7 models on a single expanding window with carryover and capacity.
+    Run all models on a single expanding window with carryover and capacity.
 
     Reports both forecast quality (coverage, interval width, RMSE) and
     decision quality (cost, CVaR, service level) independently, so reviewers
     can see where gains come from.
 
     Method hierarchy:
-      0. (s,S) Policy   - Simple reorder rule, no forecasting (practical benchmark)
-      1. SAA            - OR baseline with ML point forecast
-      2. Conformal+CVaR - Distribution-free PI + CVaR optimisation
-      3. Wasserstein DRO- Robust optimisation within Wasserstein ball
-      4. EnbPI+CQR+CVaR - Ensemble PI + conformalized quantile regression + CVaR
-      5. SPO (RF,CVaR)  - Decision-focused predict-then-optimise
-      6. Seer           - Oracle upper bound (perfect foresight)
+      0. (s,S) Policy        - Simple reorder rule, no forecasting (practical benchmark)
+      1. SAA                 - OR baseline with ML point forecast
+      2. Conformal+CVaR      - Distribution-free PI + CVaR optimisation
+      3. Wasserstein DRO     - Robust optimisation within Wasserstein ball
+      4. EnbPI+CQR+CVaR      - Ensemble PI + conformalized quantile regression + CVaR
+      5. SPO (RF,CVaR)       - Decision-focused predict-then-optimise
+      6. LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
+      7. Seer                - Oracle upper bound (perfect foresight)
 
     Methods 1–5 use Random Forest as the base predictor for a fair comparison
-    (equalising the model-architecture effect vs. optimisation method).  The
-    gap between (s,S) and the optimised methods directly quantifies the
-    value gained from combining demand forecasting with stochastic optimisation.
+    (equalising the model-architecture effect vs. optimisation method).
+    Method 6 replaces the RF base with an LSTM to show the benefit of deep
+    sequence modelling with conformal calibration guarantees.  The gap between
+    (s,S) and the optimised methods directly quantifies the value gained from
+    combining demand forecasting with stochastic optimisation.
 
     Parameters
     ----------
@@ -563,7 +637,78 @@ def run_single_window(
         logger.debug(f"SPO (RF) failed: {e}")
 
     # =========================================================================
-    # 6. SEER (ORACLE - UPPER BOUND)
+    # 6. LSTM + CONFORMAL + CVaR  (Deep-Learning method)
+    # =========================================================================
+    if _ENABLE_LSTM:
+        try:
+            start_time = time.time()
+
+            seq_len = config.data.sequence_length  # default 28
+
+            # Build 3-D sequence tensors ----------------------------------------
+            # Training: sliding window → (n_train - seq_len + 1, seq_len, features)
+            X_train_3d = _make_sequences(X_train, seq_len)
+            n_train_seq = len(X_train_3d)
+            y_train_seq = y_train[-n_train_seq:]   # align targets
+
+            # Calibration: use tail of training as history context
+            X_cal_3d = _make_sequences(X_cal, seq_len, X_context=X_train)
+            y_cal_seq = y_cal                       # one sequence per cal sample
+
+            # Test: use tail of calibration as history context
+            X_test_3d = _make_sequences(X_test, seq_len, X_context=X_cal)
+            # -------------------------------------------------------------------
+
+            lstm_model = LSTMQuantileRegression(
+                alpha=config.conformal.alpha,
+                sequence_length=seq_len,
+                hidden_size=config.lstm.hidden_size,
+                num_layers=config.lstm.num_layers,
+                dropout=config.lstm.dropout,
+                learning_rate=config.lstm.learning_rate,
+                epochs=config.lstm.epochs,
+                batch_size=config.lstm.batch_size,
+                random_state=config.random_seed,
+                device=config.device,
+            )
+            lstm_model.fit(
+                X_train_3d, y_train_seq,
+                X_cal_3d, y_cal_seq,
+                early_stopping_patience=10,
+                min_epochs=10,
+            )
+            lstm_pred = lstm_model.predict(X_test_3d)
+
+            lstm_orders = compute_order_quantities_cvar(
+                lstm_pred.point, lstm_pred.lower, lstm_pred.upper,
+                beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+                ordering_cost=costs.ordering_cost,
+                holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost,
+                random_seed=config.cvar.random_seed,
+                verbose=False,
+            )
+
+            lstm_sim = simulate_inventory_with_carryover(
+                lstm_orders, y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
+                ordering_cost=costs.ordering_cost,
+                holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost,
+            )
+            timings["LSTM_Conformal_CVaR"] = time.time() - start_time
+            sim_results["LSTM_Conformal_CVaR"] = lstm_sim
+            results["LSTM_Conformal_CVaR"] = {
+                'pred': lstm_pred, 'target_orders': lstm_orders,
+                'sim': lstm_sim, 'time': timings["LSTM_Conformal_CVaR"],
+            }
+        except Exception as e:
+            logger.debug(f"LSTM+Conformal+CVaR failed: {e}")
+
+    # =========================================================================
+    # 7. SEER (ORACLE - UPPER BOUND)
     # =========================================================================
     try:
         start_time = time.time()
@@ -1898,8 +2043,10 @@ def main(
 
     logger.info("=" * 80)
     logger.info("INVENTORY OPTIMIZATION WITH CARRYOVER & CAPACITY CONSTRAINTS")
-    logger.info("7-Model Comparison: (s,S) Policy, SAA, Conformal+CVaR, Wasserstein DRO, EnbPI+CQR+CVaR, SPO(RF), Seer")
+    logger.info("8-Method Comparison: (s,S) Policy, SAA, Conformal+CVaR, Wasserstein DRO, "
+                "EnbPI+CQR+CVaR, SPO(RF), LSTM+Conformal+CVaR, Seer")
     logger.info("Methods 1-5 use Random Forest base predictor (equalized architecture)")
+    logger.info("Method 6 uses LSTM neural network + conformal calibration (deep-learning variant)")
     logger.info("(s,S) Policy is a rule-based benchmark requiring no forecasting model")
     logger.info("=" * 80)
     logger.info(f"Stores: {store_ids}")
@@ -2070,11 +2217,19 @@ if __name__ == "__main__":
         "--stockout-cost", type=float, default=50.0,
         help="Stockout cost per unit of underage"
     )
+    parser.add_argument(
+        "--no-lstm", action="store_true", default=False,
+        help="Disable the LSTM+Conformal+CVaR method (speeds up the experiment)"
+    )
 
     args = parser.parse_args()
 
     store_ids = parse_id_range(args.stores)
     item_ids = parse_id_range(args.items)
+
+    # Set module-level LSTM flag before any work starts
+    global _ENABLE_LSTM
+    _ENABLE_LSTM = not args.no_lstm
 
     config = get_default_config()
     config.results_dir = args.output
