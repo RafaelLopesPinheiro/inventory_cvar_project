@@ -4,237 +4,294 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A comprehensive framework for demand forecasting with uncertainty quantification and CVaR-optimal inventory decisions. This project compares 13 forecasting methods hierarchically (Simple → Advanced → Your Method → DRO → Oracle) using **multi-period expanding window cross-validation** for the newsvendor problem.
+A framework for demand forecasting with uncertainty quantification and CVaR-optimal inventory decisions. The main experiment (`run_comprehensive_expanding_window.py`) compares **8 methods** under **realistic inventory dynamics** (carryover, capacity constraints) using expanding window cross-validation across multiple SKUs.
 
-## 📋 Overview
+---
 
-This project implements a rigorous comparison of **13 forecasting methods** for inventory optimization using expanding window cross-validation across multiple store-item (SKU) combinations with **multi-period evaluation**.
+## Problem Statement
 
-### Multi-Period Forecasting Approach
+Classical inventory models treat each period independently. In practice, warehouses carry leftover stock forward and operate under storage capacity limits. This project studies the **newsvendor problem with inventory dynamics**:
 
-Instead of predicting only a single horizon (e.g., 30 days ahead), this experiment evaluates models across **multiple forecast horizons simultaneously**:
-- **Day 1**: Immediate next-day demand
-- **Day 7**: Week-ahead demand
-- **Day 14**: Two-week-ahead demand
-- **Day 21**: Three-week-ahead demand
-- **Day 28**: Month-ahead demand
+- **Carryover**: Unsold inventory persists into the next period (configurable decay rate).
+- **Capacity constraint**: The warehouse has a maximum storage limit; orders are clipped accordingly.
+- **Sequential decisions**: Each period's order depends on the current inventory state rather than starting from zero.
 
-This provides:
-1. More robust evaluation across different planning horizons
-2. Better understanding of model performance degradation over time
-3. Joint optimization considering multiple future periods
-4. Scientific rigor through multi-horizon cross-validation
+The objective is to minimize expected newsvendor cost — balancing ordering, holding, and stockout costs — while controlling tail risk via **Conditional Value-at-Risk (CVaR)**.
 
-### Model Hierarchy (Simple → Advanced → Your Method → DRO → Oracle)
+Formally, given a demand distribution and inventory level `I_t`, the order quantity `q_t` is chosen to minimize:
 
-**Naive Baselines (1-3):**
-1. **Historical Quantile** - Naive empirical quantile baseline (no features)
-2. **Normal Assumption** - Parametric Gaussian assumption
-3. **Bootstrapped Newsvendor** - Resampling-based uncertainty quantification
+```
+CVaR_β(cost) = min_{q, η}  η + (1/(1−β)) · E[max(cost(q, D) − η, 0)]
+```
 
-**Operations Research Benchmarks (4-5):**
-4. **SAA** - Sample Average Approximation (standard OR baseline)
-5. **Two-Stage Stochastic** - Scenario-based optimization
+where `cost(q, D) = c_o · max(q − D, 0) + c_u · max(D − q, 0)` (overage + underage).
 
-**Distribution-Free Methods (6-7):**
-6. **Conformal Prediction** - Distribution-free intervals with coverage guarantees
-7. **Quantile Regression** - Direct quantile estimation with Conformalized Quantile Regression (CQR)
+---
 
-**Deep Learning Methods (8-10):**
-8. **LSTM Quantile Loss** - Deep learning WITHOUT calibration
-9. **LSTM+Conformal** - Deep learning WITH conformal calibration
-10. **SPO** - Decision-focused deep learning (Smart Predict-then-Optimize)
+## Experimental Approach
 
-**Your Contribution (11):**
-11. **EnbPI+CQR+CVaR** - Ensemble Batch PI + Conformalized Quantile Regression + CVaR optimization
+The main script evaluates all methods using **expanding window cross-validation**:
 
-**Advanced Benchmarks (12-13):**
-12. **DRO** - Distributionally Robust Optimization (Wasserstein)
-13. **Seer** - Oracle upper bound (perfect foresight)
+```
+|---------- Train (grows) ----------|-- Calibration --|-- Test (30 d) --|
+|---------- Train (grows) ----------|--- Calibration --|-- Test (30 d) --|
+...
+```
 
-All methods use **CVaR (Conditional Value-at-Risk)** optimization via the Rockafellar-Uryasev formulation for risk-aware inventory decisions.
+- **Initial training window**: 730 days (2 years).
+- **Calibration set**: 365 days (used for conformal calibration and threshold estimation).
+- **Test window**: 30 days, rolling forward in 30-day steps.
+- **Expanding strategy**: The training set grows with each step; the calibration set slides alongside it.
 
-## 🏗️ Project Structure
+This design ensures that every method is evaluated on genuinely out-of-sample periods with no look-ahead bias, while providing multiple paired observations for statistical testing.
+
+### Inventory Dynamics Simulation
+
+After computing order quantities, each method is passed through the same inventory simulator:
+
+```python
+# At each period t:
+available  = carryover_rate * I_{t-1} + q_t   # inventory after order arrives
+sold       = min(available, D_t)               # demand fulfilled
+I_t        = min(available - sold, capacity)   # remaining stock, capped at capacity
+cost_t     = c_h * max(available - D_t, 0) + c_u * max(D_t - available, 0)
+```
+
+Default parameters: `carryover_rate = 0.95`, `capacity = 200 units`, `c_o = $10`, `c_h = $2`, `c_u = $50`.
+
+The gap between the (s,S) benchmark (no forecasting) and the optimised methods directly quantifies **the economic value of demand forecasting combined with stochastic optimisation**.
+
+---
+
+## Method Hierarchy
+
+Methods 1–5 all use **Random Forest** as the base predictor, deliberately equalising the model-architecture effect so comparisons isolate the contribution of the uncertainty / optimisation approach. Method 6 swaps in an LSTM to assess the benefit of deep sequence modelling.
+
+| # | Method | Category | Description |
+|---|--------|----------|-------------|
+| 0 | **(s,S) Policy** | Rule-based benchmark | Fixed reorder point and order-up-to level calibrated from historical quantiles. Requires no ML. |
+| 1 | **SAA** | OR baseline | Sample Average Approximation with RF point forecast. Solves a sample-based newsvendor LP. |
+| 2 | **Conformal + CVaR** | Distribution-free | RF predictions calibrated with split conformal prediction to obtain coverage-guaranteed intervals; CVaR optimization over the interval. |
+| 3 | **Wasserstein DRO** | Robust optimization | Distributionally robust newsvendor within a Wasserstein ball around the empirical distribution. Adaptive ball radius. |
+| 4 | **EnbPI + CQR + CVaR** | **Proposed method** | Ensemble Batch Prediction Intervals (bootstrap RF ensemble) combined with Conformalized Quantile Regression for adaptive intervals; final order chosen by CVaR optimization. |
+| 5 | **SPO (RF, CVaR)** | Decision-focused | Smart Predict-then-Optimize: RF trained with residual-based CVaR newsvendor loss; explicitly minimizes decision cost rather than forecast error. |
+| 6 | **LSTM + Conformal + CVaR** | Deep learning | LSTM quantile regression with conformal calibration for coverage guarantee; CVaR optimization. Shows whether deep sequence modelling adds value over RF. |
+| 7 | **Seer (Oracle)** | Upper bound | Perfect foresight — observes actual demand before ordering. Sets the theoretical lower bound on achievable cost. |
+
+### EnbPI + CQR + CVaR (Method 4)
+
+The proposed contribution combines three complementary ideas:
+
+1. **Ensemble Batch PI (EnbPI)**: Builds a bootstrap ensemble of Random Forests. Each member is trained on a distinct subsample, producing a distribution of predictions. The ensemble spread naturally reflects epistemic uncertainty.
+
+2. **Conformalized Quantile Regression (CQR)**: Uses a held-out calibration set to correct the ensemble quantiles so that the resulting prediction interval achieves exact marginal coverage at level `1 − α` without distributional assumptions.
+
+3. **CVaR Optimization**: Given the calibrated interval `[ŷ_lower, ŷ_upper]`, samples a scenario set and solves the Rockafellar-Uryasev CVaR optimization to obtain a risk-aware order quantity:
+   - Avoids the over-conservatism of worst-case DRO.
+   - More robust to interval miscoverage than point-based SAA.
+   - Achieves coverage guarantees unavailable to uncalibrated deep learning methods.
+
+---
+
+## Project Structure
 
 ```
 inventory_cvar_project/
 ├── configs/
 │   ├── __init__.py
-│   └── config.py                          # Centralized configuration
+│   └── config.py                          # Centralized hyperparameter configuration
 ├── src/
 │   ├── data/
-│   │   ├── __init__.py
-│   │   └── loader.py                      # Data loading, feature engineering, multi-period splits
+│   │   └── loader.py                      # Data loading, feature engineering, expanding window splits
 │   ├── models/
-│   │   ├── __init__.py
-│   │   ├── base.py                        # Abstract base classes
-│   │   ├── traditional.py                 # 10 traditional forecasting models
-│   │   ├── deep_learning.py               # LSTM, SPO models
-│   │   └── multi_period.py                # Multi-period forecaster wrapper
+│   │   ├── base.py                        # Abstract base classes, PredictionResult
+│   │   ├── traditional.py                 # SAA, ConformalPrediction, EnsembleBatchPI, DRO, SPO, Seer
+│   │   ├── deep_learning.py               # LSTMQuantileRegression
+│   │   └── multi_period.py                # Multi-horizon wrapper (optional)
 │   ├── optimization/
-│   │   ├── __init__.py
-│   │   └── cvar.py                        # CVaR optimization (single & multi-period)
+│   │   └── cvar.py                        # CVaR optimization, inventory simulation, (s,S) policy
 │   ├── evaluation/
-│   │   ├── __init__.py
-│   │   └── metrics.py                     # Evaluation metrics and statistical tests
+│   │   └── metrics.py                     # Forecast and inventory metrics, statistical tests
 │   └── visualization/
-│       ├── __init__.py
 │       └── plots.py                       # Visualization utilities
 ├── scripts/
-│   └── run_comprehensive_expanding_window.py  # Main experiment runner (RECOMMENDED)
-├── tests/                                 # Unit tests
-├── notebooks/                             # Jupyter notebooks for exploration
-├── results/                               # Output directory
+│   └── run_comprehensive_expanding_window.py   # Main experiment runner
+├── tests/
+│   └── test_models.py
+├── notebooks/                             # Jupyter notebooks (exploration)
+├── results/                               # Output directory (created at runtime)
+├── train.csv                              # Demand dataset (~4.7M rows, multi-SKU)
 ├── requirements.txt
 ├── setup.py
 └── README.md
 ```
 
-## 🚀 Quick Start
+---
+
+## Quick Start
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/inventory-cvar-optimization.git
 cd inventory-cvar-optimization
 
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Install package in development mode
 pip install -e .
 ```
 
-### Running Experiments
-
-The main experiment script is `run_comprehensive_expanding_window.py`, which evaluates all 13 methods using **multi-period expanding window cross-validation**.
+### Running the Experiment
 
 ```bash
-# Single SKU with multi-period evaluation (default: horizons 1,7,14,21,28 days)
+# Single SKU, default settings
 python scripts/run_comprehensive_expanding_window.py
 
-# Multiple SKUs for robust evaluation
+# Multiple SKUs (comma-separated or range)
 python scripts/run_comprehensive_expanding_window.py \
     --stores 1,2,3 \
     --items 1,2,3,4,5 \
     --output results/multi_sku/
 
-# Custom horizons (e.g., only evaluate 1, 7, 14 days ahead)
+# Custom inventory dynamics
 python scripts/run_comprehensive_expanding_window.py \
-    --horizons 1,7,14 \
-    --output results/custom_horizons/
+    --carryover 0.9 \
+    --capacity 150 \
+    --initial-inventory 20
 
-# Skip deep learning models for faster execution (recommended for multi-SKU)
+# Custom cost parameters
 python scripts/run_comprehensive_expanding_window.py \
-    --stores 1,2,3 \
-    --items 1,2,3 \
-    --no-dl
+    --ordering-cost 8.0 \
+    --holding-cost 1.5 \
+    --stockout-cost 60.0
 
-# Use GPU for deep learning models
+# Skip LSTM for faster runs (useful for multi-SKU sweeps)
 python scripts/run_comprehensive_expanding_window.py \
-    --device cuda \
-    --epochs 100
+    --stores 1,2,3 --items 1,2,3 \
+    --no-lstm
 
-# Legacy single-period mode (not recommended)
+# Limit windows per SKU (useful for quick testing)
 python scripts/run_comprehensive_expanding_window.py \
-    --single-period \
-    --output results/single_period/
+    --windows 3
+
+# Use GPU for LSTM training
+python scripts/run_comprehensive_expanding_window.py \
+    --device cuda
+
+# Custom data file and output
+python scripts/run_comprehensive_expanding_window.py \
+    --data path/to/data.csv \
+    --output results/custom_run/
 ```
 
-**What the script does:**
+### CLI Reference
 
-1. **Loads data** for specified store-item combinations
-2. **Creates features** (time features, lags, rolling statistics)
-3. **Generates expanding windows** - training set grows over time
-4. **Trains all 13 methods** on each window for each horizon
-5. **Computes CVaR-optimal order quantities** using joint optimization
-6. **Evaluates performance** across multiple metrics
-7. **Generates comprehensive visualizations** (8 plots)
-8. **Creates detailed reports** with statistical comparisons
+| Argument | Default | Description |
+|---|---|---|
+| `--output` | `results/expanding_window_carryover` | Output directory |
+| `--stores` | `1` | Store IDs (e.g., `1,2,3` or `1-5`) |
+| `--items` | `1` | Item IDs (e.g., `1,2,3` or `1-10`) |
+| `--data` | `train.csv` | Path to demand data |
+| `--carryover` | `0.95` | Fraction of leftover stock carried forward |
+| `--capacity` | `200.0` | Warehouse capacity (units) |
+| `--initial-inventory` | `0.0` | Starting inventory |
+| `--ordering-cost` | `10.0` | Cost per unit ordered |
+| `--holding-cost` | `2.0` | Cost per unit of overage |
+| `--stockout-cost` | `50.0` | Cost per unit of underage |
+| `--windows` | `None` | Max windows per SKU (for debugging) |
+| `--no-lstm` | `False` | Disable LSTM method |
 
-### Using as a Library
+---
 
-```python
-from src.data import load_and_prepare_data, prepare_sequence_data
-from src.models import ConformalPrediction, LSTMQuantileRegression
-from src.optimization import compute_order_quantities_cvar
-from src.evaluation import compute_all_metrics
+## Features
 
-# Load data
-splits = load_and_prepare_data("train.csv", store_id=1, item_id=1)
+All models (except the (s,S) policy) use the same 10-feature set derived from raw sales data:
 
-# Train conformal prediction model
-model = ConformalPrediction(alpha=0.05)
-model.fit(splits.train.X, splits.train.y, 
-          splits.calibration.X, splits.calibration.y)
+**Time features (3):** `month`, `day_of_week`, `day_of_year`
 
-# Generate predictions
-predictions = model.predict(splits.test.X)
+**Lag features (3):** `sales_lag_1` (yesterday), `sales_lag_7` (1 week ago), `sales_lag_28` (4 weeks ago)
 
-# Compute CVaR-optimal order quantities
-orders = compute_order_quantities_cvar(
-    predictions.point, predictions.lower, predictions.upper,
-    beta=0.90, n_samples=1000
-)
+**Rolling statistics (4):** `rolling_mean_7`, `rolling_mean_28`, `rolling_std_7`, `rolling_std_28`
 
-# Evaluate
-results = compute_all_metrics(
-    "Conformal_CVaR", splits.test.y, 
-    predictions.point, orders,
-    predictions.lower, predictions.upper
-)
+The (s,S) policy uses only the historical demand distribution (training + calibration combined) to calibrate its thresholds.
+
+---
+
+## Output Files
+
+Running the script produces the following files in the output directory:
+
+```
+results/expanding_window_carryover/
+├── aggregated_results.csv          # Mean ± std per method across all windows/SKUs
+├── all_windows_results.csv         # Per-window results (one row per method × window × SKU)
+├── results_by_sku.csv              # Per-SKU aggregation (multi-SKU runs only)
+├── experiment_report.txt           # Human-readable summary with rankings and comparisons
+├── statistical_tests.csv           # Paired t-test and Wilcoxon results (Bonferroni corrected)
+│
+├── forecast_coverage_width.png     # Prediction interval coverage and width comparison
+├── forecast_rmse_mae.png           # RMSE and MAE comparison
+├── cvar90_comparison.png           # CVaR-90 boxplots across all windows
+├── mean_cost_comparison.png        # Mean cost bar chart with error bars
+├── service_level_comparison.png    # Service level comparison
+├── inventory_dynamics.png          # Inventory level trajectories (last window)
+├── cost_breakdown.png              # Holding vs. stockout cost breakdown
+├── timing_comparison.png           # Execution time per method
+├── statistical_tests.png           # p-value heatmap and Cohen's d heatmap
+└── statistical_forest_plot.png     # Forest plot of paired differences
 ```
 
-## 📊 Output & Results
+### Key Report Sections
 
-When you run `run_comprehensive_expanding_window.py`, it generates:
+The `experiment_report.txt` contains:
 
-### Generated Files
+- **Cost parameters and experiment settings** used for the run.
+- **Value of optimisation**: Each method's cost saving (absolute + %) vs. the (s,S) benchmark.
+- **Forecast quality table**: Coverage, interval width, MAE, RMSE, MAPE per method.
+- **Decision quality table**: Mean Cost, CVaR-90, CVaR-95, Service Level, Capacity Utilisation, Carryover, Wall-clock time.
+- **Carryover & capacity impact**: Holding/stockout breakdown and capacity utilisation per method.
 
-**Results Directory** (default: `results/multi_period_expanding/`):
-```
-results/multi_period_expanding/
-├── combined_results.csv           # All window results combined
-├── aggregated_results.csv         # Aggregated statistics per method
-├── summary_report.txt             # Text summary with key findings
-├── model_comparison.png           # Bar chart comparing methods
-├── cvar_comparison.png            # CVaR-90 and CVaR-95 comparison
-├── coverage_width_tradeoff.png    # Coverage vs interval width scatter
-├── horizon_analysis.png           # Performance by forecast horizon
-├── method_rankings.png            # Ranking across metrics
-├── cost_distribution.png          # Box plots of cost distributions
-├── timing_comparison.png          # Execution time comparison
-└── timing_vs_cvar_tradeoff.png    # Speed vs performance trade-off
-```
+---
 
-### Features Used (9 total)
+## Metrics
 
-All models (except HistoricalQuantile) use the same feature set:
+### Forecast Quality
 
-**Time Features (3):**
-- `month` - Month of year (1-12)
-- `day_of_week` - Day of week (0-6)
-- `day_of_year` - Day of year (1-365)
+| Metric | Description | Goal |
+|---|---|---|
+| **Coverage** | Fraction of actual demands within the prediction interval | ≥ 95% (matches `1 − α`) |
+| **Avg Interval Width** | Mean `ŷ_upper − ŷ_lower` | Narrower is better at equal coverage |
+| **MAE** | Mean Absolute Error of point forecast | Lower |
+| **RMSE** | Root Mean Squared Error | Lower |
+| **MAPE** | Mean Absolute Percentage Error | Lower |
 
-**Lag Features (3):**
-- `sales_lag_1` - Yesterday's sales
-- `sales_lag_7` - Sales 7 days ago
-- `sales_lag_28` - Sales 28 days ago
+### Decision Quality (Primary)
 
-**Rolling Statistics (4):**
-- `rolling_mean_7` - 7-day rolling mean
-- `rolling_mean_28` - 28-day rolling mean
-- `rolling_std_7` - 7-day rolling standard deviation
-- `rolling_std_28` - 28-day rolling standard deviation
+| Metric | Description | Goal |
+|---|---|---|
+| **Mean Cost** | Average daily newsvendor cost (ordering + holding + stockout) | Lower |
+| **CVaR-90** | Expected cost in worst 10% of days | Lower (tail risk) |
+| **CVaR-95** | Expected cost in worst 5% of days | Lower (extreme tail risk) |
+| **Service Level** | Fraction of periods without stockouts | Higher |
+| **Avg Carryover** | Mean leftover inventory carried forward | Contextual |
+| **Avg Capacity Util** | Mean fraction of warehouse capacity used | Contextual |
 
-**Note:** HistoricalQuantile is a naive baseline that intentionally uses NO features (only historical demand values), serving as the simplest possible baseline.
+### Statistical Validity
 
-## 🔧 Configuration
+Results are validated with:
+
+- **Paired t-test**: Tests whether the mean difference between two methods is zero across windows.
+- **Wilcoxon signed-rank test**: Non-parametric alternative, more robust to non-normality.
+- **Bonferroni correction**: Adjusts the significance threshold for the number of comparisons (`α / (n_methods × n_metrics)`).
+- **Cohen's d**: Effect size (|d| < 0.2 = negligible, 0.2–0.5 = small, 0.5–0.8 = medium, > 0.8 = large).
+
+The reference method for all comparisons is **EnbPI + CQR + CVaR** (Method 4).
+
+---
+
+## Configuration
 
 All hyperparameters are centralized in `configs/config.py`:
 
@@ -243,72 +300,142 @@ from configs import get_default_config
 
 config = get_default_config()
 
-# Modify cost parameters
+# Inventory dynamics
+config.cost.carryover_rate = 0.95   # 95% of leftover stock carries forward
+config.cost.capacity = 200.0        # warehouse limit (units)
+config.cost.initial_inventory = 0.0
+
+# Newsvendor costs
 config.cost.ordering_cost = 10.0
 config.cost.holding_cost = 2.0
 config.cost.stockout_cost = 50.0
 
-# Modify CVaR settings
-config.cvar.beta = 0.90  # 90% CVaR
+# CVaR level
+config.cvar.beta = 0.90   # optimize for worst 10% of outcomes
 
-# Modify deep learning settings
-config.lstm.epochs = 100
+# Conformal coverage
+config.conformal.alpha = 0.05   # target 95% coverage
+
+# EnbPI ensemble
+config.ensemble_batch_pi.n_ensemble = 10
+config.ensemble_batch_pi.bootstrap_fraction = 0.8
+config.ensemble_batch_pi.use_quantile_regression = True
+
+# LSTM
 config.lstm.hidden_size = 64
+config.lstm.num_layers = 2
+config.lstm.epochs = 100
+config.lstm.dropout = 0.2
+
+# Expanding window splits
+config.rolling_window.initial_train_days = 730
+config.rolling_window.calibration_days = 365
+config.rolling_window.test_window_days = 30
+config.rolling_window.step_days = 30
 ```
 
-## 📈 Metrics
+---
 
-The experiment evaluates models across multiple metrics:
+## Using as a Library
 
-### Forecasting Metrics
-- **Coverage**: Proportion of actual values within prediction intervals (target: 95%)
-- **Average Interval Width**: Mean width of prediction intervals (narrower is better)
+```python
+from src.data import load_raw_data, filter_store_item, create_all_features, create_rolling_window_splits
+from src.models import EnsembleBatchPI, SampleAverageApproximation
+from src.optimization import compute_order_quantities_cvar, simulate_inventory_with_carryover, CostParameters
 
-### Inventory Metrics (Primary)
-- **Mean Cost**: Average daily newsvendor cost (lower is better)
-- **CVaR-90**: Expected cost in the worst 10% of days (tail risk, lower is better)
-- **CVaR-95**: Expected cost in the worst 5% of days (extreme tail risk, lower is better)
-- **Service Level**: Proportion of days without stockouts (higher is better)
+# Load and prepare data
+df_raw = load_raw_data("train.csv")
+df = filter_store_item(df_raw, store_id=1, item_id=1)
+df, feature_cols = create_all_features(df, lag_periods=[1, 7, 28], rolling_windows=[7, 28])
+splits = create_rolling_window_splits(df, feature_cols)
 
-### Multi-Period Specific
-- **Per-Horizon Metrics**: Separate evaluation for each forecast horizon (1, 7, 14, 21, 28 days)
-- **Aggregated Metrics**: Combined performance across all horizons (mean/sum/worst-case)
-- **Joint Optimization**: Order quantities optimized considering all horizons simultaneously
+window = splits[0]
 
-### Experimental Design Details
+# Train EnbPI + CQR
+model = EnsembleBatchPI(alpha=0.05, n_ensemble=10, n_estimators=100)
+model.fit(window.train.X, window.train.y, window.calibration.X, window.calibration.y)
+pred = model.predict(window.test.X)
 
-- **Expanding Window**: Training set grows over time (not sliding window)
-- **Direct Strategy**: Separate model trained for each horizon
-- **Calibration Set**: Fixed size (30 days default) for conformal calibration
-- **Test Window**: Aligned with maximum horizon (28 days default)
-- **Statistical Testing**: Paired t-tests for significance (p < 0.05)
+# CVaR-optimal order quantities
+orders = compute_order_quantities_cvar(
+    pred.point, pred.lower, pred.upper,
+    beta=0.90, n_samples=1000,
+    ordering_cost=10.0, holding_cost=2.0, stockout_cost=50.0
+)
 
-## 📚 References
+# Simulate with inventory dynamics
+sim = simulate_inventory_with_carryover(
+    orders, window.test.y,
+    initial_inventory=0.0, carryover_rate=0.95, capacity=200.0,
+    ordering_cost=10.0, holding_cost=2.0, stockout_cost=50.0
+)
 
-### Core Methodology
-1. **Rockafellar & Uryasev (2000)** - "Optimization of conditional value-at-risk" - CVaR optimization
-2. **Taieb et al. (2012)** - "A review and comparison of strategies for multi-step ahead forecasting" - Multi-period forecasting
-3. **Hyndman & Athanasopoulos (2021)** - "Forecasting: Principles and Practice" - Time series foundations
+print(f"Mean Cost:     ${sim.mean_cost:.2f}")
+print(f"CVaR-90:       ${sim.cvar_90:.2f}")
+print(f"Service Level: {sim.service_level*100:.1f}%")
+```
+
+---
+
+## References
+
+### CVaR Optimization & Newsvendor Problem
+
+1. **Rockafellar & Uryasev (2000)** — "Optimization of conditional value-at-risk." *Journal of Risk*, 2(3), 21–42.
+   Introduces the CVaR linear programming formulation used here.
+
+2. **Scarf (1958)** — "A min-max solution of an inventory problem." *Studies in the Mathematical Theory of Inventory and Production*, 201–209.
+   Foundational distributionally robust newsvendor.
+
+3. **Ban & Rudin (2019)** — "The big data newsvendor: Practical insights from machine learning." *Operations Research*, 67(1), 90–108.
+   Data-driven approach to newsvendor with contextual features.
 
 ### Conformal Prediction
-4. **Vovk et al. (2005)** - "Algorithmic Learning in a Random World" - Conformal prediction theory
-5. **Romano et al. (2019)** - "Conformalized Quantile Regression" - CQR method
-6. **Xu & Xie (2021)** - "Conformal prediction interval for dynamic time-series" - EnbPI method
-7. **Barber et al. (2019)** - "Predictive inference with the jackknife+" - Jackknife+ for time series
+
+4. **Vovk, Gammerman & Shafer (2005)** — *Algorithmic Learning in a Random World.* Springer.
+   Theoretical foundation of conformal prediction.
+
+5. **Romano, Patterson & Candès (2019)** — "Conformalized quantile regression." *NeurIPS 2019*.
+   CQR method for adaptive, distribution-free prediction intervals.
+
+6. **Xu & Xie (2021)** — "Conformal prediction interval for dynamic time-series." *ICML 2021*.
+   EnbPI: Ensemble Batch Prediction Intervals for sequential data.
+
+7. **Barber, Candès, Ramdas & Tibshirani (2019)** — "Predictive inference with the jackknife+." *Annals of Statistics*, 49(1).
+   Jackknife+ for cross-conformal prediction.
+
+### Distributionally Robust Optimization
+
+8. **Esfahani & Kuhn (2018)** — "Data-driven distributionally robust optimization using the Wasserstein metric." *Mathematical Programming*, 171(1), 115–166.
+   Wasserstein DRO framework used in Method 3.
+
+9. **Gao & Kleywegt (2023)** — "Distributionally robust stochastic optimization with Wasserstein distance." *Mathematics of Operations Research*, 48(2).
 
 ### Decision-Focused Learning
-8. **Elmachtoub & Grigas (2017)** - "Smart 'Predict, then Optimize'" - SPO framework
-9. **Donti et al. (2017)** - "Task-based End-to-end Model Learning" - End-to-end optimization
-10. **Ban & Rudin (2019)** - "The Big Data Newsvendor" - Data-driven newsvendor
+
+10. **Elmachtoub & Grigas (2022)** — "Smart 'predict, then optimize'." *Management Science*, 68(1), 9–26.
+    SPO+ loss function that directly optimizes decision quality.
+
+11. **Donti, Amos & Kolter (2017)** — "Task-based end-to-end model learning in stochastic optimization." *NeurIPS 2017*.
+    End-to-end differentiable optimization.
 
 ### Deep Learning for Forecasting
-11. **Wen et al. (2017)** - "A Multi-Horizon Quantile Recurrent Forecaster" - LSTM quantile regression
-12. **Gasthaus et al. (2019)** - "Probabilistic Forecasting with Spline Quantile" - Quantile networks
 
-## 🤝 Contributing
+12. **Wen et al. (2017)** — "A multi-horizon quantile recurrent forecaster." *NeurIPS 2017 Time Series Workshop*.
+    LSTM with simultaneous quantile outputs.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+13. **Lim, Arık, Loeff & Pfister (2021)** — "Temporal fusion transformers for interpretable multi-horizon time series forecasting." *International Journal of Forecasting*, 37(4).
+    TFT architecture (available in `src/models/deep_learning.py`).
 
-## 📄 License
+### Inventory Management
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+14. **Zipkin (2000)** — *Foundations of Inventory Management.* McGraw-Hill.
+    Standard reference for (s,S) policies and newsvendor theory.
+
+15. **Snyder & Stenger (1996)** — "Inventory models with uncertain demand." Survey of classical policies.
+
+---
+
+## License
+
+This project is licensed under the MIT License — see the LICENSE file for details.
