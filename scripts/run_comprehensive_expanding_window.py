@@ -99,6 +99,8 @@ from src.models import (
 )
 from src.optimization import (
     compute_order_quantities_cvar,
+    compute_inventory_aware_orders_cvar,
+    compute_inventory_aware_orders_dro,
     CostParameters,
     simulate_inventory_with_carryover,
     simulate_sS_policy_with_carryover,
@@ -463,7 +465,8 @@ def run_single_window(
             capacity=costs.capacity,
             ordering_cost=costs.ordering_cost,
             holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            stockout_cost=costs.stockout_cost,
+            inventory_aware=True,
         )
         timings["SAA"] = time.time() - start_time
         sim_results["SAA"] = saa_sim
@@ -487,23 +490,21 @@ def run_single_window(
         )
         cp_model.fit(X_train, y_train, X_cal, y_cal)
         cp_pred = cp_model.predict(X_test)
-        cp_orders = compute_order_quantities_cvar(
-            cp_pred.point, cp_pred.lower, cp_pred.upper,
-            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
-            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
-            verbose=False
-        )
 
-        cp_sim = simulate_inventory_with_carryover(
-            cp_orders, y_test,
+        # Inventory-aware CVaR: sequential optimization with on-hand inventory
+        cp_sim = compute_inventory_aware_orders_cvar(
+            cp_pred.point, cp_pred.lower, cp_pred.upper,
+            actual_demands=y_test,
             initial_inventory=costs.initial_inventory,
             carryover_rate=costs.carryover_rate,
             capacity=costs.capacity,
-            ordering_cost=costs.ordering_cost,
-            holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+            verbose=False,
         )
+        cp_orders = cp_sim.actual_orders
+
         timings["Conformal_CVaR"] = time.time() - start_time
         sim_results["Conformal_CVaR"] = cp_sim
         results["Conformal_CVaR"] = {
@@ -533,19 +534,22 @@ def run_single_window(
         )
         dro_model.fit(X_train, y_train, X_cal, y_cal)
         dro_pred = dro_model.predict(X_test)
-        dro_orders = dro_model.compute_order_quantities(
-            X_test, dro_pred.point, dro_pred.lower, dro_pred.upper
-        )
 
-        dro_sim = simulate_inventory_with_carryover(
-            dro_orders, y_test,
+        # Inventory-aware DRO: sequential optimization with on-hand inventory
+        dro_sim = compute_inventory_aware_orders_dro(
+            dro_pred.point, dro_pred.lower, dro_pred.upper,
+            actual_demands=y_test,
+            epsilon=0.1,
             initial_inventory=costs.initial_inventory,
             carryover_rate=costs.carryover_rate,
             capacity=costs.capacity,
-            ordering_cost=costs.ordering_cost,
-            holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            beta=config.cvar.beta, n_samples=500,
+            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+            verbose=False,
         )
+        dro_orders = dro_sim.actual_orders
+
         timings["Wasserstein_DRO"] = time.time() - start_time
         sim_results["Wasserstein_DRO"] = dro_sim
         results["Wasserstein_DRO"] = {
@@ -571,23 +575,21 @@ def run_single_window(
         )
         enbpi_model.fit(X_train, y_train, X_cal, y_cal)
         enbpi_pred = enbpi_model.predict(X_test)
-        enbpi_orders = compute_order_quantities_cvar(
-            enbpi_pred.point, enbpi_pred.lower, enbpi_pred.upper,
-            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
-            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
-            verbose=False
-        )
 
-        enbpi_sim = simulate_inventory_with_carryover(
-            enbpi_orders, y_test,
+        # Inventory-aware CVaR: sequential optimization with on-hand inventory
+        enbpi_sim = compute_inventory_aware_orders_cvar(
+            enbpi_pred.point, enbpi_pred.lower, enbpi_pred.upper,
+            actual_demands=y_test,
             initial_inventory=costs.initial_inventory,
             carryover_rate=costs.carryover_rate,
             capacity=costs.capacity,
-            ordering_cost=costs.ordering_cost,
-            holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+            verbose=False,
         )
+        enbpi_orders = enbpi_sim.actual_orders
+
         timings["EnbPI_CQR_CVaR"] = time.time() - start_time
         sim_results["EnbPI_CQR_CVaR"] = enbpi_sim
         results["EnbPI_CQR_CVaR"] = {
@@ -625,7 +627,8 @@ def run_single_window(
             capacity=costs.capacity,
             ordering_cost=costs.ordering_cost,
             holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            stockout_cost=costs.stockout_cost,
+            inventory_aware=True,
         )
         timings["SPO_EndToEnd"] = time.time() - start_time
         sim_results["SPO_EndToEnd"] = spo_sim
@@ -679,8 +682,13 @@ def run_single_window(
             )
             lstm_pred = lstm_model.predict(X_test_3d)
 
-            lstm_orders = compute_order_quantities_cvar(
+            # Inventory-aware CVaR: sequential optimization with on-hand inventory
+            lstm_sim = compute_inventory_aware_orders_cvar(
                 lstm_pred.point, lstm_pred.lower, lstm_pred.upper,
+                actual_demands=y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
                 beta=config.cvar.beta, n_samples=config.cvar.n_samples,
                 ordering_cost=costs.ordering_cost,
                 holding_cost=costs.holding_cost,
@@ -688,16 +696,7 @@ def run_single_window(
                 random_seed=config.cvar.random_seed,
                 verbose=False,
             )
-
-            lstm_sim = simulate_inventory_with_carryover(
-                lstm_orders, y_test,
-                initial_inventory=costs.initial_inventory,
-                carryover_rate=costs.carryover_rate,
-                capacity=costs.capacity,
-                ordering_cost=costs.ordering_cost,
-                holding_cost=costs.holding_cost,
-                stockout_cost=costs.stockout_cost,
-            )
+            lstm_orders = lstm_sim.actual_orders
             timings["LSTM_Conformal_CVaR"] = time.time() - start_time
             sim_results["LSTM_Conformal_CVaR"] = lstm_sim
             results["LSTM_Conformal_CVaR"] = {
@@ -729,7 +728,8 @@ def run_single_window(
             capacity=costs.capacity,
             ordering_cost=costs.ordering_cost,
             holding_cost=costs.holding_cost,
-            stockout_cost=costs.stockout_cost
+            stockout_cost=costs.stockout_cost,
+            inventory_aware=True,
         )
         timings["Seer"] = time.time() - start_time
         sim_results["Seer"] = seer_sim

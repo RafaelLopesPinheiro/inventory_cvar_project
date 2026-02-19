@@ -80,20 +80,23 @@ def optimize_cvar_single(
     beta: float = 0.90,
     ordering_cost: float = 10.0,
     holding_cost: float = 2.0,
-    stockout_cost: float = 50.0
+    stockout_cost: float = 50.0,
+    current_inventory: float = 0.0,
+    max_order: Optional[float] = None,
 ) -> float:
     """
     Optimize order quantity using CVaR via Rockafellar-Uryasev LP formulation.
 
-    Reformulates the CVaR minimization as a Linear Program (LP):
+    When current_inventory > 0, the LP accounts for on-hand stock so that
+    overage / underage are computed on (inventory + q) vs demand:
 
         min_{q, τ, h_i, u_i, z_i}  τ + (1 / (N * (1 - β))) * Σ z_i
 
-        s.t.  h_i >= q - d_i          (overage linearization)
-              u_i >= d_i - q          (underage linearization)
+        s.t.  h_i >= (I + q) - d_i    (overage linearization)
+              u_i >= d_i - (I + q)    (underage linearization)
               z_i >= c_o*q + c_h*h_i + c_u*u_i - τ  (CVaR slack)
               h_i, u_i, z_i >= 0
-              q >= 0
+              0 <= q <= max_order
 
     Parameters
     ----------
@@ -103,18 +106,26 @@ def optimize_cvar_single(
         CVaR level (tail probability).
     ordering_cost, holding_cost, stockout_cost : float
         Cost parameters.
+    current_inventory : float
+        On-hand inventory at the start of the period (default 0 for
+        backward compatibility with single-period usage).
+    max_order : float or None
+        Maximum order quantity (e.g. capacity - current_inventory).
+        None means no upper bound.
 
     Returns
     -------
     float
-        Optimal order quantity.
+        Optimal order quantity (net new units to order).
     """
     n = len(demand_samples)
     c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
+    I = current_inventory
 
     prob = pulp.LpProblem("CVaR_Newsvendor", pulp.LpMinimize)
 
-    q = pulp.LpVariable("q", lowBound=0)
+    q = pulp.LpVariable("q", lowBound=0,
+                         upBound=max_order if max_order is not None else None)
     tau = pulp.LpVariable("tau")
 
     # Linearization variables for each demand scenario
@@ -128,8 +139,10 @@ def optimize_cvar_single(
     # Constraints for each demand scenario
     for i in range(n):
         d_i = float(demand_samples[i])
-        prob += h[i] >= q - d_i                                      # h_i >= q - d_i
-        prob += u[i] >= d_i - q                                      # u_i >= d_i - q
+        # Overage / underage based on total available (I + q) vs demand
+        prob += h[i] >= (I + q) - d_i                                # h_i >= (I+q) - d_i
+        prob += u[i] >= d_i - (I + q)                                # u_i >= d_i - (I+q)
+        # Cost: ordering cost only on *new* order q
         prob += z[i] >= c_o * q + c_h * h[i] + c_u * u[i] - tau    # z_i >= Loss_i - τ
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
@@ -277,7 +290,9 @@ def optimize_wasserstein_dro_single(
     beta: float = 0.90,
     ordering_cost: float = 10.0,
     holding_cost: float = 2.0,
-    stockout_cost: float = 50.0
+    stockout_cost: float = 50.0,
+    current_inventory: float = 0.0,
+    max_order: Optional[float] = None,
 ) -> float:
     """
     Optimize order quantity using Wasserstein Distributionally Robust Optimization.
@@ -285,19 +300,27 @@ def optimize_wasserstein_dro_single(
     Solves the worst-case CVaR over all distributions within an epsilon-Wasserstein
     ball centered at the empirical distribution, via a Linear Program (LP).
 
-    The formulation is:
-        min_q max_{P: W(P, P̂) ≤ ε} CVaR_β(Loss(q, D))
+    When current_inventory > 0, the LP accounts for on-hand stock so that the
+    loss is computed on total available (I + q) vs demand, with ordering cost
+    applied only to the new order q.
 
-    For the newsvendor problem with Wasserstein ambiguity, this is solved as:
+    The inventory-aware formulation is:
+        min_q max_{P: W(P, P̂) ≤ ε} CVaR_β(Loss(q, D, I))
+
+    where Loss(q, d, I) = c_o*q + c_h*max(0, I+q-d) + c_u*max(0, d-I-q)
+
+    Solved as:
 
         min_{q, λ, τ, r_u, r_h, wc_i, z_i}  λε + τ + (1/(N(1-β))) Σ z_i
 
-        s.t.  r_u >= c_u - λ                               (adversarial gain, stockout side)
-              r_h >= c_h - λ                               (adversarial gain, overage side)
-              wc_i >= (c_o - c_u)*q + c_u*d̂_i + ε*r_u    (worst-case loss, stockout)
-              wc_i >= (c_o + c_h)*q - c_h*d̂_i + ε*r_h    (worst-case loss, overage)
-              z_i  >= wc_i - τ                             (CVaR slack)
-              q, λ, r_u, r_h, wc_i, z_i >= 0
+        s.t.  r_u >= c_u - λ
+              r_h >= c_h - λ
+              wc_i >= (c_o - c_u)*(I+q) + c_u*d̂_i + ε*r_u + c_o*I  (stockout side, adjusted)
+              wc_i >= (c_o + c_h)*(I+q) - c_h*d̂_i + ε*r_h - c_o*I  (overage side, adjusted)
+                  [simplified: the above reduces to using s = I+q as the stocking variable
+                   then converting the ordering cost to only apply to q]
+              z_i  >= wc_i - τ
+              0 <= q <= max_order
 
     Parameters
     ----------
@@ -305,16 +328,19 @@ def optimize_wasserstein_dro_single(
         Samples from the empirical demand distribution.
     epsilon : float
         Wasserstein ball radius (controls robustness level).
-        Larger epsilon = more robust but more conservative.
     beta : float
         CVaR level (tail probability).
     ordering_cost, holding_cost, stockout_cost : float
         Cost parameters.
+    current_inventory : float
+        On-hand inventory at the start of the period.
+    max_order : float or None
+        Maximum order quantity (e.g. capacity - current_inventory).
 
     Returns
     -------
     float
-        Optimal robust order quantity.
+        Optimal robust order quantity (net new units to order).
 
     References
     ----------
@@ -327,11 +353,13 @@ def optimize_wasserstein_dro_single(
     """
     n = len(demand_samples)
     c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
+    I = current_inventory
     lipschitz_constant = max(c_h, c_u)
 
     prob = pulp.LpProblem("DRO_Newsvendor", pulp.LpMinimize)
 
-    q = pulp.LpVariable("q", lowBound=0)
+    q = pulp.LpVariable("q", lowBound=0,
+                         upBound=max_order if max_order is not None else None)
     lam = pulp.LpVariable("lam", lowBound=0, upBound=lipschitz_constant)
     tau = pulp.LpVariable("tau")
 
@@ -353,10 +381,17 @@ def optimize_wasserstein_dro_single(
 
     for i in range(n):
         d_hat = float(demand_samples[i])
-        # Worst-case loss from stockout side (adversary increases demand)
-        prob += wc[i] >= (c_o - c_u) * q + c_u * d_hat + epsilon * r_u
-        # Worst-case loss from overage side (adversary decreases demand)
-        prob += wc[i] >= (c_o + c_h) * q - c_h * d_hat + epsilon * r_h
+        # Worst-case loss: the adversary perturbs demands within the Wasserstein ball.
+        # With inventory I, total available is I + q. The newsvendor cost decomposes as:
+        #   Loss(q,d,I) = c_o*q + c_h*max(0, I+q-d) + c_u*max(0, d-I-q)
+        # Stockout side (adversary increases demand beyond I+q):
+        #   wc_i >= c_o*q + c_u*(d_hat - I - q) + epsilon * r_u
+        #         = c_o*q - c_u*(I+q) + c_u*d_hat + epsilon * r_u
+        prob += wc[i] >= c_o * q - c_u * (I + q) + c_u * d_hat + epsilon * r_u
+        # Overage side (adversary decreases demand below I+q):
+        #   wc_i >= c_o*q + c_h*(I+q - d_hat) + epsilon * r_h
+        #         = c_o*q + c_h*(I+q) - c_h*d_hat + epsilon * r_h
+        prob += wc[i] >= c_o * q + c_h * (I + q) - c_h * d_hat + epsilon * r_h
         # CVaR slack: z_i >= wc_i - τ
         prob += z[i] >= wc[i] - tau
 
@@ -872,6 +907,256 @@ def compute_order_quantities_multi_period_cvar(
         return {h: np.array(horizon_orders[h]) for h in horizons}
 
 
+# =============================================================================
+# INVENTORY-AWARE SEQUENTIAL OPTIMIZATION
+# =============================================================================
+
+def compute_inventory_aware_orders_cvar(
+    point_pred: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    actual_demands: np.ndarray,
+    initial_inventory: float = 0.0,
+    carryover_rate: float = 0.95,
+    capacity: float = 200.0,
+    beta: float = 0.90,
+    n_samples: int = 1000,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    random_seed: int = 42,
+    verbose: bool = True,
+) -> 'InventorySimulationResult':
+    """
+    Inventory-aware CVaR optimization with sequential decision making.
+
+    At each period t the decision-maker:
+      1. Observes current on-hand inventory I_t (from carryover of t-1).
+      2. Solves a CVaR LP that accounts for I_t: the LP optimises the
+         *net order* q_t while evaluating overage/underage on (I_t + q_t).
+      3. Receives the order, demand d_t realises, and carryover propagates.
+
+    This replaces the two-step "optimise-then-simulate" pipeline where
+    the CVaR LP ignores on-hand inventory.
+
+    Parameters
+    ----------
+    point_pred : np.ndarray
+        Point predictions for each test day.
+    lower : np.ndarray
+        Lower bounds of prediction intervals.
+    upper : np.ndarray
+        Upper bounds of prediction intervals.
+    actual_demands : np.ndarray
+        Actual realized demand for each period (for simulation).
+    initial_inventory : float
+        Starting inventory level.
+    carryover_rate : float
+        Fraction of leftover inventory that carries to next period.
+    capacity : float
+        Maximum warehouse storage capacity.
+    beta : float
+        CVaR level (tail probability).
+    n_samples : int
+        Number of demand samples to generate per period.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    random_seed : int
+        Random seed for reproducibility.
+    verbose : bool
+        Whether to print progress.
+
+    Returns
+    -------
+    InventorySimulationResult
+        Combined optimization + simulation results.
+    """
+    n_days = len(point_pred)
+    inventory = initial_inventory
+
+    if verbose:
+        logger.info(f"Inventory-aware CVaR optimization (beta={beta}) for {n_days} days...")
+
+    actual_orders = np.zeros(n_days)
+    inventory_levels = np.zeros(n_days)
+    carryover_inv = np.zeros(n_days)
+    costs = np.zeros(n_days)
+    ord_costs = np.zeros(n_days)
+    hold_costs = np.zeros(n_days)
+    stock_costs = np.zeros(n_days)
+    cap_util = np.zeros(n_days)
+
+    for t in range(n_days):
+        carryover_inv[t] = inventory
+
+        # Remaining capacity for new orders
+        max_order = max(0.0, capacity - inventory)
+
+        # Generate demand samples from prediction intervals
+        rng = np.random.RandomState(random_seed + t)
+        demand_samples = rng.uniform(lower[t], upper[t], n_samples)
+
+        # Solve inventory-aware CVaR LP
+        q_opt = optimize_cvar_single(
+            demand_samples, beta,
+            ordering_cost, holding_cost, stockout_cost,
+            current_inventory=inventory,
+            max_order=max_order,
+        )
+
+        # Apply capacity constraint (defensive)
+        actual_order = max(0.0, min(q_opt, max_order))
+
+        # Available inventory after ordering
+        available = inventory + actual_order
+        inventory_levels[t] = available
+        cap_util[t] = available / capacity if capacity > 0 else 0.0
+
+        # Demand realisation
+        demand = actual_demands[t]
+
+        # Cost components
+        overage = max(0.0, available - demand)
+        underage = max(0.0, demand - available)
+
+        oc = ordering_cost * actual_order
+        hc = holding_cost * overage
+        sc = stockout_cost * underage
+
+        actual_orders[t] = actual_order
+        ord_costs[t] = oc
+        hold_costs[t] = hc
+        stock_costs[t] = sc
+        costs[t] = oc + hc + sc
+
+        # Carryover to next period
+        inventory = overage * carryover_rate
+
+    return InventorySimulationResult(
+        actual_orders=actual_orders,
+        inventory_levels=inventory_levels,
+        carryover_inventory=carryover_inv,
+        costs=costs,
+        ordering_costs=ord_costs,
+        holding_costs=hold_costs,
+        stockout_costs=stock_costs,
+        demands=actual_demands.copy(),
+        capacity_utilization=cap_util,
+    )
+
+
+def compute_inventory_aware_orders_dro(
+    point_pred: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    actual_demands: np.ndarray,
+    epsilon: float = 0.1,
+    initial_inventory: float = 0.0,
+    carryover_rate: float = 0.95,
+    capacity: float = 200.0,
+    beta: float = 0.90,
+    n_samples: int = 1000,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    random_seed: int = 42,
+    verbose: bool = True,
+) -> 'InventorySimulationResult':
+    """
+    Inventory-aware Wasserstein DRO optimization with sequential decisions.
+
+    Identical structure to ``compute_inventory_aware_orders_cvar`` but
+    uses the distributionally robust optimiser at each period.
+
+    Parameters
+    ----------
+    point_pred, lower, upper : np.ndarray
+        Forecasts for each test day.
+    actual_demands : np.ndarray
+        Actual realized demand for simulation.
+    epsilon : float
+        Wasserstein ball radius for DRO.
+    initial_inventory, carryover_rate, capacity : float
+        Inventory dynamics parameters.
+    beta : float
+        CVaR level.
+    n_samples : int
+        Number of demand samples per period.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    random_seed : int
+        Random seed.
+    verbose : bool
+        Whether to print progress.
+
+    Returns
+    -------
+    InventorySimulationResult
+        Combined optimization + simulation results.
+    """
+    n_days = len(point_pred)
+    inventory = initial_inventory
+
+    if verbose:
+        logger.info(f"Inventory-aware DRO optimization (eps={epsilon}, beta={beta}) for {n_days} days...")
+
+    actual_orders = np.zeros(n_days)
+    inventory_levels = np.zeros(n_days)
+    carryover_inv = np.zeros(n_days)
+    costs = np.zeros(n_days)
+    ord_costs = np.zeros(n_days)
+    hold_costs = np.zeros(n_days)
+    stock_costs = np.zeros(n_days)
+    cap_util = np.zeros(n_days)
+
+    for t in range(n_days):
+        carryover_inv[t] = inventory
+        max_order = max(0.0, capacity - inventory)
+
+        rng = np.random.RandomState(random_seed + t)
+        demand_samples = rng.uniform(lower[t], upper[t], n_samples)
+
+        q_opt = optimize_wasserstein_dro_single(
+            demand_samples, epsilon, beta,
+            ordering_cost, holding_cost, stockout_cost,
+            current_inventory=inventory,
+            max_order=max_order,
+        )
+
+        actual_order = max(0.0, min(q_opt, max_order))
+        available = inventory + actual_order
+        inventory_levels[t] = available
+        cap_util[t] = available / capacity if capacity > 0 else 0.0
+
+        demand = actual_demands[t]
+        overage = max(0.0, available - demand)
+        underage = max(0.0, demand - available)
+
+        oc = ordering_cost * actual_order
+        hc = holding_cost * overage
+        sc = stockout_cost * underage
+
+        actual_orders[t] = actual_order
+        ord_costs[t] = oc
+        hold_costs[t] = hc
+        stock_costs[t] = sc
+        costs[t] = oc + hc + sc
+
+        inventory = overage * carryover_rate
+
+    return InventorySimulationResult(
+        actual_orders=actual_orders,
+        inventory_levels=inventory_levels,
+        carryover_inventory=carryover_inv,
+        costs=costs,
+        ordering_costs=ord_costs,
+        holding_costs=hold_costs,
+        stockout_costs=stock_costs,
+        demands=actual_demands.copy(),
+        capacity_utilization=cap_util,
+    )
+
+
 @dataclass
 class InventorySimulationResult:
     """Results from inventory simulation with carryover and capacity constraints."""
@@ -926,14 +1211,20 @@ def simulate_inventory_with_carryover(
     capacity: float = 200.0,
     ordering_cost: float = 10.0,
     holding_cost: float = 2.0,
-    stockout_cost: float = 50.0
+    stockout_cost: float = 50.0,
+    inventory_aware: bool = True,
 ) -> InventorySimulationResult:
     """
     Simulate inventory dynamics with carryover and capacity constraints.
 
     At each period t:
     1. Start with carryover inventory I_t from previous period
-    2. Compute actual order: q_t = min(target_q_t, capacity - I_t)
+    2. Compute actual order:
+       - If inventory_aware=True (default): targets are treated as
+         *order-up-to stocking levels*.  The net order is
+         q_t = max(0, target_t - I_t), capped by (capacity - I_t).
+       - If inventory_aware=False: targets are treated as raw order
+         quantities.  q_t = min(target_t, capacity - I_t).
     3. Available inventory: A_t = I_t + q_t
     4. Demand d_t arrives
     5. Overage: max(0, A_t - d_t), Underage: max(0, d_t - A_t)
@@ -943,7 +1234,12 @@ def simulate_inventory_with_carryover(
     Parameters
     ----------
     target_order_quantities : np.ndarray
-        Desired order quantities from the optimization (before constraints).
+        When inventory_aware=True these are *stocking-level targets*
+        (order-up-to levels) produced by CVaR / newsvendor optimisers.
+        The simulation converts them to net orders by subtracting
+        current on-hand inventory.
+        When inventory_aware=False (legacy mode) these are raw order
+        quantities applied directly.
     actual_demands : np.ndarray
         Actual realized demand for each period.
     initial_inventory : float
@@ -959,6 +1255,12 @@ def simulate_inventory_with_carryover(
         Cost per unit of overage.
     stockout_cost : float
         Cost per unit of underage.
+    inventory_aware : bool
+        If True (default), interpret targets as order-up-to stocking
+        levels and subtract on-hand inventory to get the net order.
+        This is the correct behaviour for all standard optimisation
+        methods (CVaR, SAA, newsvendor) whose output represents the
+        optimal *total* inventory to hold, not additional units.
 
     Returns
     -------
@@ -980,9 +1282,16 @@ def simulate_inventory_with_carryover(
     for t in range(n_days):
         carryover_inv[t] = inventory
 
-        # Constrain order by capacity (can't exceed warehouse limit)
+        # Remaining warehouse capacity
         max_order = max(0, capacity - inventory)
-        actual_order = max(0, min(target_order_quantities[t], max_order))
+
+        if inventory_aware:
+            # Target is an order-up-to level: order only what's needed
+            net_order = max(0, target_order_quantities[t] - inventory)
+            actual_order = min(net_order, max_order)
+        else:
+            # Legacy: target is a raw order quantity
+            actual_order = max(0, min(target_order_quantities[t], max_order))
 
         # Available inventory after ordering
         available = inventory + actual_order
