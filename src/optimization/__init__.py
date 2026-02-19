@@ -10,6 +10,9 @@ from .cvar import (
     # DRO optimization
     optimize_wasserstein_dro_single,
     compute_order_quantities_dro,
+    # Inventory-aware sequential optimization
+    compute_inventory_aware_orders_cvar,
+    compute_inventory_aware_orders_dro,
     # Multi-period optimization
     multi_period_newsvendor_loss,
     optimize_multi_period_cvar_single,
@@ -32,6 +35,9 @@ __all__ = [
     # DRO optimization
     "optimize_wasserstein_dro_single",
     "compute_order_quantities_dro",
+    # Inventory-aware sequential optimization
+    "compute_inventory_aware_orders_cvar",
+    "compute_inventory_aware_orders_dro",
     # Multi-period optimization
     "multi_period_newsvendor_loss",
     "optimize_multi_period_cvar_single",
