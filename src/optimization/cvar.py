@@ -83,6 +83,7 @@ def optimize_cvar_single(
     stockout_cost: float = 50.0,
     current_inventory: float = 0.0,
     max_order: Optional[float] = None,
+    sl_target: Optional[float] = None,
 ) -> float:
     """
     Optimize order quantity using CVaR via Rockafellar-Uryasev LP formulation.
@@ -97,6 +98,12 @@ def optimize_cvar_single(
               z_i >= c_o*q + c_h*h_i + c_u*u_i - τ  (CVaR slack)
               h_i, u_i, z_i >= 0
               0 <= q <= max_order
+              I + q >= Q_{sl_target}(D)  (service level, if sl_target is set)
+
+    The service-level constraint enforces P(I + q >= D) >= sl_target by
+    requiring total available inventory to cover at least the sl_target-th
+    quantile of the demand scenarios.  This is a single linear constraint
+    because Q_{sl_target}(D) is a constant once the scenarios are fixed.
 
     Parameters
     ----------
@@ -112,6 +119,10 @@ def optimize_cvar_single(
     max_order : float or None
         Maximum order quantity (e.g. capacity - current_inventory).
         None means no upper bound.
+    sl_target : float or None
+        Minimum required service level, e.g. 0.95 for SL >= 95%.
+        When set, adds the constraint I + q >= quantile(demand_samples, sl_target).
+        None (default) disables the constraint for backward compatibility.
 
     Returns
     -------
@@ -144,6 +155,12 @@ def optimize_cvar_single(
         prob += u[i] >= d_i - (I + q)                                # u_i >= d_i - (I+q)
         # Cost: ordering cost only on *new* order q
         prob += z[i] >= c_o * q + c_h * h[i] + c_u * u[i] - tau    # z_i >= Loss_i - τ
+
+    # Service-level constraint: P(I + q >= D) >= sl_target
+    # Approximated over scenarios: I + q >= Q_{sl_target}(demand_samples)
+    if sl_target is not None:
+        d_sl = float(np.quantile(demand_samples, sl_target))
+        prob += I + q >= d_sl
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
@@ -926,6 +943,8 @@ def compute_inventory_aware_orders_cvar(
     stockout_cost: float = 50.0,
     random_seed: int = 42,
     verbose: bool = True,
+    demand_residuals: Optional[np.ndarray] = None,
+    sl_target: Optional[float] = None,
 ) -> 'InventorySimulationResult':
     """
     Inventory-aware CVaR optimization with sequential decision making.
@@ -965,6 +984,20 @@ def compute_inventory_aware_orders_cvar(
         Random seed for reproducibility.
     verbose : bool
         Whether to print progress.
+    demand_residuals : np.ndarray or None
+        Calibration residuals (y_cal - point_pred_cal) for residual-based
+        scenario generation (CQR+SPO hybrid).  When provided, scenarios for
+        each period are drawn as::
+
+            demand_scenarios = max(0, point_pred[t] + bootstrap(demand_residuals))
+
+        instead of uniform sampling from [lower[t], upper[t]].
+        None (default) keeps the original uniform interval-sampling.
+    sl_target : float or None
+        Minimum required service level passed through to
+        ``optimize_cvar_single``.  When set (e.g. 0.95), enforces
+        P(I + q >= D) >= sl_target via a single linear constraint added to
+        the Rockafellar-Uryasev LP.  None disables the constraint.
 
     Returns
     -------
@@ -975,7 +1008,12 @@ def compute_inventory_aware_orders_cvar(
     inventory = initial_inventory
 
     if verbose:
-        logger.info(f"Inventory-aware CVaR optimization (beta={beta}) for {n_days} days...")
+        sl_str = f", SL>={sl_target*100:.0f}%" if sl_target is not None else ""
+        scenario_str = "residual-based" if demand_residuals is not None else "uniform-interval"
+        logger.info(
+            f"Inventory-aware CVaR optimization (beta={beta}{sl_str}, "
+            f"scenarios={scenario_str}) for {n_days} days..."
+        )
 
     actual_orders = np.zeros(n_days)
     inventory_levels = np.zeros(n_days)
@@ -992,16 +1030,24 @@ def compute_inventory_aware_orders_cvar(
         # Remaining capacity for new orders
         max_order = max(0.0, capacity - inventory)
 
-        # Generate demand samples from prediction intervals
+        # Generate demand scenarios
         rng = np.random.RandomState(random_seed + t)
-        demand_samples = rng.uniform(lower[t], upper[t], n_samples)
+        if demand_residuals is not None:
+            # Residual-based scenarios (CQR+SPO): bootstrap calibration residuals
+            # and add to point forecast, clipping at zero (demand >= 0).
+            sampled_residuals = rng.choice(demand_residuals, size=n_samples, replace=True)
+            demand_samples = np.maximum(0.0, point_pred[t] + sampled_residuals)
+        else:
+            # Interval-based scenarios: uniform sampling from [lower, upper]
+            demand_samples = rng.uniform(lower[t], upper[t], n_samples)
 
-        # Solve inventory-aware CVaR LP
+        # Solve inventory-aware CVaR LP (with optional SL constraint)
         q_opt = optimize_cvar_single(
             demand_samples, beta,
             ordering_cost, holding_cost, stockout_cost,
             current_inventory=inventory,
             max_order=max_order,
+            sl_target=sl_target,
         )
 
         # Apply capacity constraint (defensive)
