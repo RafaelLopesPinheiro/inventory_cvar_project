@@ -13,7 +13,7 @@ Unlike the standard single-period newsvendor, this experiment models:
 - Capacity: Warehouse has a maximum storage limit
 - Sequential decisions: Each period's order depends on current inventory state
 
-MODEL HIERARCHY (7 Methods + simple policy benchmark):
+MODEL HIERARCHY (8 Methods + simple policy benchmark):
 =======================================================
 Methods 1-5 use Random Forest as the base predictor to equalize the effect of
 model architecture vs. the uncertainty/optimization method.  Method 6 uses an
@@ -23,10 +23,11 @@ LSTM neural network to assess the benefit of deep sequence modelling.
 1. SAA                 - Sample Average Approximation (OR benchmark)
 2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
 3. Wasserstein DRO     - Distributionally Robust Optimization
-4. EnbPI + CQR + CVaR  - Ensemble Batch PI + Conformalized Quantile Regression + CVaR
+4. EnbPI+CQR+CVaR(SL95)- Ensemble Batch PI + CQR + CVaR with explicit SL>=95% constraint
 5. SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
 6. LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
 7. Seer               - Oracle upper bound (perfect foresight)
+8. CQR+SPO (Hybrid)   - EnbPI+CQR intervals + SPO residual-based CVaR scenarios
 
 EVALUATION:
 ===========
@@ -136,11 +137,13 @@ MODEL_CATEGORIES = {
     "5_EndToEnd": ["SPO_EndToEnd"],
     "6_DeepLearning": ["LSTM_Conformal_CVaR"],
     "7_Oracle": ["Seer"],
+    "8_HybridCQR_SPO": ["CQR_SPO"],
 }
 
 MODEL_ORDER = [
     'sS_Policy', 'SAA', 'Conformal_CVaR', 'Wasserstein_DRO',
     'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'LSTM_Conformal_CVaR', 'Seer',
+    'CQR_SPO',
 ]
 
 MODEL_DISPLAY_NAMES = {
@@ -148,10 +151,11 @@ MODEL_DISPLAY_NAMES = {
     "SAA": "1. SAA",
     "Conformal_CVaR": "2. Conformal + CVaR",
     "Wasserstein_DRO": "3. Wasserstein DRO",
-    "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR",
+    "EnbPI_CQR_CVaR": "4. EnbPI+CQR+CVaR (SL95)",
     "SPO_EndToEnd": "5. SPO (RF, CVaR)",
     "LSTM_Conformal_CVaR": "6. LSTM+Conformal+CVaR",
     "Seer": "7. Seer (Oracle)",
+    "CQR_SPO": "8. CQR+SPO (Hybrid)",
 }
 
 MODEL_COLORS = {
@@ -163,6 +167,7 @@ MODEL_COLORS = {
     "SPO_EndToEnd": "#e377c2",
     "LSTM_Conformal_CVaR": "#17becf",
     "Seer": "#2ca02c",
+    "CQR_SPO": "#bcbd22",
 }
 
 
@@ -350,14 +355,15 @@ def run_single_window(
     can see where gains come from.
 
     Method hierarchy:
-      0. (s,S) Policy        - Simple reorder rule, no forecasting (practical benchmark)
-      1. SAA                 - OR baseline with ML point forecast
-      2. Conformal+CVaR      - Distribution-free PI + CVaR optimisation
-      3. Wasserstein DRO     - Robust optimisation within Wasserstein ball
-      4. EnbPI+CQR+CVaR      - Ensemble PI + conformalized quantile regression + CVaR
-      5. SPO (RF,CVaR)       - Decision-focused predict-then-optimise
-      6. LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
-      7. Seer                - Oracle upper bound (perfect foresight)
+      0. (s,S) Policy            - Simple reorder rule, no forecasting (practical benchmark)
+      1. SAA                     - OR baseline with ML point forecast
+      2. Conformal+CVaR          - Distribution-free PI + CVaR optimisation
+      3. Wasserstein DRO         - Robust optimisation within Wasserstein ball
+      4. EnbPI+CQR+CVaR (SL95)  - Ensemble PI + CQR + CVaR with SL>=95% constraint (Task 1)
+      5. SPO (RF,CVaR)           - Decision-focused predict-then-optimise
+      6. LSTM+Conformal+CVaR     - LSTM quantile regression + conformal calibration + CVaR
+      7. Seer                    - Oracle upper bound (perfect foresight)
+      8. CQR+SPO (Hybrid)        - EnbPI+CQR intervals + residual-based CVaR scenarios (Task 2)
 
     Methods 1–5 use Random Forest as the base predictor for a fair comparison
     (equalising the model-architecture effect vs. optimisation method).
@@ -576,7 +582,8 @@ def run_single_window(
         enbpi_model.fit(X_train, y_train, X_cal, y_cal)
         enbpi_pred = enbpi_model.predict(X_test)
 
-        # Inventory-aware CVaR: sequential optimization with on-hand inventory
+        # Inventory-aware CVaR with SL >= 95% constraint: sequential optimization
+        # with on-hand inventory and explicit service-level floor.
         enbpi_sim = compute_inventory_aware_orders_cvar(
             enbpi_pred.point, enbpi_pred.lower, enbpi_pred.upper,
             actual_demands=y_test,
@@ -587,6 +594,7 @@ def run_single_window(
             ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
             stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
             verbose=False,
+            sl_target=0.95,   # Task 1: enforce P(I+q >= D) >= 95% over scenarios
         )
         enbpi_orders = enbpi_sim.actual_orders
 
@@ -638,6 +646,58 @@ def run_single_window(
         }
     except Exception as e:
         logger.debug(f"SPO (RF) failed: {e}")
+
+    # =========================================================================
+    # 5b. CQR+SPO HYBRID (Task 2)
+    # EnbPI+CQR for forecasting/intervals; residual-based scenarios for CVaR LP.
+    #
+    # Motivation: SPO achieves the best CVaR-90 because it builds demand scenarios
+    # from calibration residuals rather than uniform interval sampling.  Here we
+    # keep the superior EnbPI+CQR prediction intervals (for coverage/width metrics)
+    # but swap the scenario-generation step in the CVaR LP to use bootstrap
+    # residuals — the lowest-effort, highest-impact combination.
+    #
+    # Residuals are computed as:  ε_i = y_cal_i - enbpi_point_pred_cal_i
+    # Scenarios for period t:     D_t^(s) = max(0, ŷ_t + ε*_s),  ε* ~ Bootstrap(ε)
+    # =========================================================================
+    try:
+        start_time = time.time()
+
+        # Re-use the already-fitted enbpi_model (trained in method 4 above).
+        # If method 4 failed, enbpi_model won't be defined — skip gracefully.
+        if 'EnbPI_CQR_CVaR' in results:
+            # Compute point predictions on the calibration set to derive residuals.
+            # These signed residuals capture heteroscedastic uncertainty and are
+            # used as bootstrap pool for scenario generation in the CVaR LP.
+            enbpi_cal_pred = enbpi_model.predict(X_cal)
+            cqr_spo_residuals = y_cal - enbpi_cal_pred.point  # signed residuals
+
+            # Re-use test-set intervals from enbpi_pred (already computed in method 4)
+            # for forecast quality evaluation; only scenario generation changes.
+            cqr_spo_sim = compute_inventory_aware_orders_cvar(
+                enbpi_pred.point, enbpi_pred.lower, enbpi_pred.upper,
+                actual_demands=y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
+                beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+                ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+                verbose=False,
+                demand_residuals=cqr_spo_residuals,   # SPO-style residual scenarios
+                sl_target=None,                        # No extra SL constraint here
+            )
+            cqr_spo_orders = cqr_spo_sim.actual_orders
+
+            timings["CQR_SPO"] = time.time() - start_time
+            sim_results["CQR_SPO"] = cqr_spo_sim
+            results["CQR_SPO"] = {
+                'pred': enbpi_pred,          # same intervals as EnbPI+CQR+CVaR
+                'target_orders': cqr_spo_orders,
+                'sim': cqr_spo_sim, 'time': timings["CQR_SPO"]
+            }
+    except Exception as e:
+        logger.debug(f"CQR+SPO hybrid failed: {e}")
 
     # =========================================================================
     # 6. LSTM + CONFORMAL + CVaR  (Deep-Learning method)
@@ -1586,6 +1646,22 @@ def create_summary_report(
         report.append(f"  Capacity Util:       {spo_df['Avg_Capacity_Util'].mean()*100:.1f}%")
         report.append(f"  Avg Carryover:       {spo_df['Avg_Carryover'].mean():.1f} units")
 
+    # CQR+SPO Hybrid performance (Task 2)
+    if 'CQR_SPO' in combined_df['Method'].values:
+        report.append(f"\n[CQR+SPO HYBRID (Task 2) — EnbPI+CQR intervals + residual-based CVaR]")
+        cqr_spo_df = combined_df[combined_df['Method'] == 'CQR_SPO']
+        report.append(f"  Mean Cost:           ${cqr_spo_df['Mean_Cost'].mean():.2f}")
+        report.append(f"  CVaR-90:             ${cqr_spo_df['CVaR_90'].mean():.2f}")
+        report.append(f"  Service Level:       {cqr_spo_df['Service_Level'].mean()*100:.1f}%")
+        report.append(f"  Capacity Util:       {cqr_spo_df['Avg_Capacity_Util'].mean()*100:.1f}%")
+        report.append(f"  Avg Carryover:       {cqr_spo_df['Avg_Carryover'].mean():.1f} units")
+        if 'SPO_EndToEnd' in mean_costs and 'CQR_SPO' in mean_costs:
+            imp = (mean_costs['SPO_EndToEnd'] - mean_costs['CQR_SPO']) / mean_costs['SPO_EndToEnd'] * 100
+            report.append(f"  Improvement vs SPO:  {imp:+.1f}%")
+        if 'EnbPI_CQR_CVaR' in mean_costs and 'CQR_SPO' in mean_costs:
+            imp = (mean_costs['EnbPI_CQR_CVaR'] - mean_costs['CQR_SPO']) / mean_costs['EnbPI_CQR_CVaR'] * 100
+            report.append(f"  vs EnbPI+CQR+CVaR:   {imp:+.1f}%")
+
     # (s,S) policy — simple reorder benchmark
     if 'sS_Policy' in combined_df['Method'].values:
         sS_df = combined_df[combined_df['Method'] == 'sS_Policy']
@@ -2043,8 +2119,8 @@ def main(
 
     logger.info("=" * 80)
     logger.info("INVENTORY OPTIMIZATION WITH CARRYOVER & CAPACITY CONSTRAINTS")
-    logger.info("8-Method Comparison: (s,S) Policy, SAA, Conformal+CVaR, Wasserstein DRO, "
-                "EnbPI+CQR+CVaR, SPO(RF), LSTM+Conformal+CVaR, Seer")
+    logger.info("9-Method Comparison: (s,S) Policy, SAA, Conformal+CVaR, Wasserstein DRO, "
+                "EnbPI+CQR+CVaR(SL95), SPO(RF), LSTM+Conformal+CVaR, Seer, CQR+SPO(Hybrid)")
     logger.info("Methods 1-5 use Random Forest base predictor (equalized architecture)")
     logger.info("Method 6 uses LSTM neural network + conformal calibration (deep-learning variant)")
     logger.info("(s,S) Policy is a rule-based benchmark requiring no forecasting model")
