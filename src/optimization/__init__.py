@@ -23,6 +23,8 @@ from .cvar import (
     InventorySimulationResult,
     simulate_inventory_with_carryover,
     simulate_sS_policy_with_carryover,
+    # Lead-time simulation
+    simulate_inventory_with_lead_time,
 )
 
 __all__ = [
@@ -49,4 +51,6 @@ __all__ = [
     "simulate_inventory_with_carryover",
     # (s, S) policy simulation
     "simulate_sS_policy_with_carryover",
+    # Lead-time simulation
+    "simulate_inventory_with_lead_time",
 ]

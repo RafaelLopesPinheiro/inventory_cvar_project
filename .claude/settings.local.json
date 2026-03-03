@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"c:\\\\Users\\\\Rafael Lopes\\\\Desktop\\\\inventory_cvar_project\\\\walmart\"\" 2>/dev/null || echo \"walmart directory not found or empty \")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\(''scripts/run_walmart_experiment.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")"
+    ]
+  }
+}

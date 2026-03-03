@@ -27,6 +27,8 @@ from .loader import (
     create_multi_period_targets,
     create_multi_period_rolling_window_splits,
     load_and_prepare_multi_period_rolling_data,
+    # M5 dataset loader
+    load_m5_data,
 )
 
 __all__ = [
@@ -56,4 +58,6 @@ __all__ = [
     "create_multi_period_targets",
     "create_multi_period_rolling_window_splits",
     "load_and_prepare_multi_period_rolling_data",
+    # M5 dataset loader
+    "load_m5_data",
 ]

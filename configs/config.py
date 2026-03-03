@@ -93,11 +93,11 @@ class QuantileRegressionConfig:
 class LSTMConfig:
     """LSTM Quantile Regression settings."""
     alpha: float = 0.05
-    hidden_size: int = 64
+    hidden_size: int = 128   # increased from 64; 64 produced MAE=8.85 vs RF's 4.66
     num_layers: int = 2
-    dropout: float = 0.2
+    dropout: float = 0.1     # reduced from 0.2; less aggressive regularization
     learning_rate: float = 0.001
-    epochs: int = 100
+    epochs: int = 150        # increased from 100 to give more training budget
     batch_size: int = 32
     quantiles: List[float] = field(default_factory=lambda: [0.025, 0.5, 0.975])
 

@@ -339,12 +339,15 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
         y_train: np.ndarray,
         X_cal: np.ndarray,
         y_cal: np.ndarray,
-        early_stopping_patience: int = 15,
+        early_stopping_patience: int = 20,
         min_epochs: int = 20
     ) -> "LSTMQuantileRegression":
         """Train LSTM and calibrate prediction intervals with early stopping."""
         logger.info("Training LSTM Quantile Regression (with early stopping)...")
-        logger.info(f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}")
+        logger.info(
+            f"Architecture: {self.num_layers} layers, hidden_size={self.hidden_size}, "
+            f"dropout={self.dropout}, weight_decay=1e-4"
+        )
 
         # Set random seed
         torch.manual_seed(self.random_state)
@@ -373,9 +376,10 @@ class LSTMQuantileRegression(BaseDeepLearningForecaster):
             quantiles=self.quantiles
         ).to(self.device)
 
-        # Loss and optimizer
+        # Loss and optimizer (weight_decay=1e-4: L2 regularization to counter overfitting
+        # on short retail time-series where LSTM tends to memorise training patterns)
         criterion = QuantileLoss(self.quantiles)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
         # Early stopping
@@ -554,9 +558,10 @@ class LSTMQuantileLossOnly(BaseDeepLearningForecaster):
             quantiles=self.quantiles
         ).to(self.device)
 
-        # Loss and optimizer
+        # Loss and optimizer (weight_decay=1e-4: L2 regularization to counter overfitting
+        # on short retail time-series where LSTM tends to memorise training patterns)
         criterion = QuantileLoss(self.quantiles)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
         # Early stopping

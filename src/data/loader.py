@@ -1202,3 +1202,132 @@ def load_and_prepare_multi_period_rolling_data(
     )
 
     return splits
+
+
+# =============================================================================
+# M5 DATASET LOADER
+# =============================================================================
+
+def load_m5_data(
+    sales_path: str,
+    calendar_path: str,
+    store_filter: Optional[List[str]] = None,
+    dept_filter: Optional[List[str]] = None,
+    max_items_per_store: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Load M5 Walmart competition data and convert to the same long-format
+    DataFrame used by the rest of the pipeline (columns: date, store, item, sales).
+
+    The M5 dataset (Kaggle "M5 Forecasting - Accuracy") is stored in wide format:
+    each row is an (item, store) pair and each column d_1 ... d_1941 is daily sales.
+    This function pivots to long format and assigns integer IDs compatible with
+    ``filter_store_item``.
+
+    Parameters
+    ----------
+    sales_path : str
+        Path to ``sales_train_evaluation.csv`` (or ``sales_train_validation.csv``).
+    calendar_path : str
+        Path to ``calendar.csv``.
+    store_filter : list of str, optional
+        Restrict to specific store IDs (M5 strings, e.g. ``["CA_1", "TX_1"]``).
+        If None, all 10 stores are included.
+    dept_filter : list of str, optional
+        Restrict to specific department IDs (e.g. ``["FOODS_1", "HOBBIES_1"]``).
+        If None, all departments are included.
+    max_items_per_store : int, optional
+        Cap on the number of distinct items to load per store.
+        Useful for quick experiments. None = no cap.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: ``date``, ``store`` (int), ``item`` (int),
+        ``sales`` (float).  The integer store/item codes are stable across
+        calls with the same filter arguments (sorted alphabetically).
+
+    Notes
+    -----
+    - Only the demand columns ``d_*`` are kept; price/event features are ignored
+      here since ``create_all_features`` will construct the feature set.
+    - Rows with NaN sales (if any) are dropped.
+
+    Examples
+    --------
+    >>> df = load_m5_data(
+    ...     "data/m5/sales_train_evaluation.csv",
+    ...     "data/m5/calendar.csv",
+    ...     store_filter=["CA_1", "CA_2"],
+    ...     max_items_per_store=10,
+    ... )
+    >>> df.head()
+    """
+    logger.info(f"Loading M5 data from {sales_path}")
+
+    # -----------------------------------------------------------------
+    # 1. Read the wide-format sales file
+    # -----------------------------------------------------------------
+    sales_df = pd.read_csv(sales_path)
+
+    # Apply store filter
+    if store_filter is not None:
+        sales_df = sales_df[sales_df['store_id'].isin(store_filter)].copy()
+        logger.info(f"M5 store filter: {store_filter} -> {len(sales_df)} series")
+
+    # Apply department filter
+    if dept_filter is not None:
+        sales_df = sales_df[sales_df['dept_id'].isin(dept_filter)].copy()
+        logger.info(f"M5 dept filter: {dept_filter} -> {len(sales_df)} series")
+
+    # Cap items per store
+    if max_items_per_store is not None:
+        kept_rows = []
+        for store_id, grp in sales_df.groupby('store_id'):
+            kept_rows.append(grp.head(max_items_per_store))
+        sales_df = pd.concat(kept_rows, ignore_index=True)
+        logger.info(f"M5 item cap {max_items_per_store}/store -> {len(sales_df)} series")
+
+    # -----------------------------------------------------------------
+    # 2. Build stable integer codes for store and item
+    # -----------------------------------------------------------------
+    store_codes = {s: i + 1 for i, s in enumerate(sorted(sales_df['store_id'].unique()))}
+    item_codes  = {it: i + 1 for i, it in enumerate(sorted(sales_df['item_id'].unique()))}
+    sales_df['store_int'] = sales_df['store_id'].map(store_codes)
+    sales_df['item_int']  = sales_df['item_id'].map(item_codes)
+
+    # -----------------------------------------------------------------
+    # 3. Identify demand columns and melt to long format
+    # -----------------------------------------------------------------
+    id_cols   = ['store_int', 'item_int']
+    d_cols    = [c for c in sales_df.columns if c.startswith('d_') and c[2:].isdigit()]
+    keep_cols = id_cols + d_cols
+
+    melted = (
+        sales_df[keep_cols]
+        .melt(id_vars=id_cols, var_name='d', value_name='sales')
+    )
+
+    # -----------------------------------------------------------------
+    # 4. Map d-column to calendar date
+    # -----------------------------------------------------------------
+    calendar = pd.read_csv(calendar_path, parse_dates=['date'])
+    date_map  = calendar.set_index('d')['date'].to_dict()
+    melted['date'] = melted['d'].map(date_map)
+    melted = melted.dropna(subset=['date', 'sales'])
+    melted['sales'] = melted['sales'].astype(float)
+
+    # Rename to match pipeline convention
+    result = (
+        melted[['date', 'store_int', 'item_int', 'sales']]
+        .rename(columns={'store_int': 'store', 'item_int': 'item'})
+        .sort_values(['store', 'item', 'date'])
+        .reset_index(drop=True)
+    )
+
+    logger.info(
+        f"M5 data loaded: {len(result)} records, "
+        f"{result['store'].nunique()} stores, {result['item'].nunique()} items, "
+        f"dates {result['date'].min().date()} to {result['date'].max().date()}"
+    )
+    return result

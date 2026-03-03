@@ -737,8 +737,8 @@ def run_single_window(
             lstm_model.fit(
                 X_train_3d, y_train_seq,
                 X_cal_3d, y_cal_seq,
-                early_stopping_patience=10,
-                min_epochs=10,
+                early_stopping_patience=20,   # was 10; tuned to reduce premature stopping
+                min_epochs=20,
             )
             lstm_pred = lstm_model.predict(X_test_3d)
 

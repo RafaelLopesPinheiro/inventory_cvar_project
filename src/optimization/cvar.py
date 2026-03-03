@@ -84,6 +84,7 @@ def optimize_cvar_single(
     current_inventory: float = 0.0,
     max_order: Optional[float] = None,
     sl_target: Optional[float] = None,
+    sl_bound: Optional[float] = None,
 ) -> float:
     """
     Optimize order quantity using CVaR via Rockafellar-Uryasev LP formulation.
@@ -98,17 +99,17 @@ def optimize_cvar_single(
               z_i >= c_o*q + c_h*h_i + c_u*u_i - τ  (CVaR slack)
               h_i, u_i, z_i >= 0
               0 <= q <= max_order
-              I + q >= Q_{sl_target}(D)  (service level, if sl_target is set)
+              I + q >= sl_bound        (service level, if sl_bound is set)
 
     The service-level constraint enforces P(I + q >= D) >= sl_target by
-    requiring total available inventory to cover at least the sl_target-th
-    quantile of the demand scenarios.  This is a single linear constraint
-    because Q_{sl_target}(D) is a constant once the scenarios are fixed.
+    requiring total available inventory to cover the CQR conformal upper
+    bound (sl_bound), which has a finite-sample coverage guarantee:
+        P(true_demand <= sl_bound) >= 1 - alpha.
 
     Parameters
     ----------
     demand_samples : np.ndarray
-        Samples from the demand distribution.
+        Samples from the demand distribution (used for CVaR objective only).
     beta : float
         CVaR level (tail probability).
     ordering_cost, holding_cost, stockout_cost : float
@@ -120,9 +121,15 @@ def optimize_cvar_single(
         Maximum order quantity (e.g. capacity - current_inventory).
         None means no upper bound.
     sl_target : float or None
-        Minimum required service level, e.g. 0.95 for SL >= 95%.
-        When set, adds the constraint I + q >= quantile(demand_samples, sl_target).
-        None (default) disables the constraint for backward compatibility.
+        Deprecated fallback. When sl_bound is None and sl_target is set,
+        adds I + q >= quantile(demand_samples, sl_target) as a fallback.
+        Prefer passing sl_bound directly for a conformal-guaranteed constraint.
+    sl_bound : float or None
+        Direct service-level bound (e.g. CQR conformal upper bound upper[t]).
+        When set, adds I + q >= sl_bound to the LP.  This is preferred over
+        sl_target because it uses the conformal coverage guarantee directly
+        rather than an in-sample scenario quantile, closing the gap between
+        the nominal SL constraint and the realized out-of-sample service level.
 
     Returns
     -------
@@ -156,9 +163,15 @@ def optimize_cvar_single(
         # Cost: ordering cost only on *new* order q
         prob += z[i] >= c_o * q + c_h * h[i] + c_u * u[i] - tau    # z_i >= Loss_i - τ
 
-    # Service-level constraint: P(I + q >= D) >= sl_target
-    # Approximated over scenarios: I + q >= Q_{sl_target}(demand_samples)
-    if sl_target is not None:
+    # Service-level constraint: I + q >= sl_bound
+    # Priority: sl_bound (CQR upper bound, conformal guarantee) > sl_target fallback
+    if sl_bound is not None:
+        # Preferred: use the pre-computed CQR conformal upper bound directly.
+        # P(true_demand <= sl_bound) >= 1-alpha by the conformal coverage guarantee,
+        # so this constraint ensures realized SL >= 1-alpha.
+        prob += I + q >= float(sl_bound)
+    elif sl_target is not None:
+        # Fallback: scenario-quantile approximation (less reliable under dist. shift).
         d_sl = float(np.quantile(demand_samples, sl_target))
         prob += I + q >= d_sl
 
@@ -1024,6 +1037,10 @@ def compute_inventory_aware_orders_cvar(
     stock_costs = np.zeros(n_days)
     cap_util = np.zeros(n_days)
 
+    # Diagnostic: track SL constraint slack when sl_target is active
+    sl_slack = np.full(n_days, np.nan)
+    sl_binding_count = 0
+
     for t in range(n_days):
         carryover_inv[t] = inventory
 
@@ -1041,17 +1058,38 @@ def compute_inventory_aware_orders_cvar(
             # Interval-based scenarios: uniform sampling from [lower, upper]
             demand_samples = rng.uniform(lower[t], upper[t], n_samples)
 
+        # Determine SL bound for this period.
+        # When sl_target is set and we have interval forecasts (not residual-based),
+        # use the CQR conformal upper bound directly as the SL floor.
+        # P(true_demand <= upper[t]) >= 1-alpha by the conformal coverage guarantee,
+        # so I + q >= upper[t] ensures realized SL >= 1-alpha (unlike the old approach
+        # which used a scenario-quantile that underestimates demand under dist. shift).
+        period_sl_bound: Optional[float] = None
+        if sl_target is not None and demand_residuals is None:
+            period_sl_bound = float(upper[t])
+
         # Solve inventory-aware CVaR LP (with optional SL constraint)
         q_opt = optimize_cvar_single(
             demand_samples, beta,
             ordering_cost, holding_cost, stockout_cost,
             current_inventory=inventory,
             max_order=max_order,
-            sl_target=sl_target,
+            sl_target=sl_target if demand_residuals is not None else None,
+            sl_bound=period_sl_bound,
         )
 
         # Apply capacity constraint (defensive)
         actual_order = max(0.0, min(q_opt, max_order))
+
+        # Diagnostic: measure SL constraint slack (positive = not binding, 0 = binding)
+        if sl_target is not None:
+            effective_sl_bound = period_sl_bound if period_sl_bound is not None else (
+                float(np.quantile(demand_samples, sl_target))
+            )
+            slack_t = (inventory + actual_order) - effective_sl_bound
+            sl_slack[t] = slack_t
+            if abs(slack_t) < 1e-4:
+                sl_binding_count += 1
 
         # Available inventory after ordering
         available = inventory + actual_order
@@ -1077,6 +1115,18 @@ def compute_inventory_aware_orders_cvar(
 
         # Carryover to next period
         inventory = overage * carryover_rate
+
+    # Log SL constraint diagnostics
+    if sl_target is not None and verbose:
+        binding_frac = sl_binding_count / n_days if n_days > 0 else 0.0
+        valid_slack = sl_slack[~np.isnan(sl_slack)]
+        mean_slack = float(np.mean(valid_slack)) if len(valid_slack) > 0 else 0.0
+        bound_type = "CQR upper bound" if demand_residuals is None else "scenario quantile"
+        logger.info(
+            f"SL constraint diagnostics (bound={bound_type}): "
+            f"binding {sl_binding_count}/{n_days} periods ({binding_frac:.1%}), "
+            f"mean slack={mean_slack:.2f} units"
+        )
 
     return InventorySimulationResult(
         actual_orders=actual_orders,
@@ -1629,4 +1679,125 @@ def compute_multi_period_metrics(
         aggregated_cvar_95=aggregated_cvar_95,
         aggregated_service_level=aggregated_service_level,
         horizons=horizons
+    )
+
+
+# =============================================================================
+# LEAD-TIME INVENTORY SIMULATION
+# =============================================================================
+
+def simulate_inventory_with_lead_time(
+    order_quantities: np.ndarray,
+    actual_demands: np.ndarray,
+    lead_time: int = 1,
+    initial_inventory: float = 0.0,
+    carryover_rate: float = 0.95,
+    capacity: float = 200.0,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+) -> 'InventorySimulationResult':
+    """
+    Simulate inventory dynamics with a positive replenishment lead time.
+
+    At each period t:
+      1. Orders placed L periods earlier arrive: in_transit[t] = q_{t-L}.
+      2. Available inventory: A_t = carryover * I_{t-1} + in_transit[t].
+         (clipped at capacity after arrival)
+      3. Demand d_t is realised: sold = min(A_t, d_t).
+      4. Carryover to t+1: I_t = (A_t - sold) * carryover_rate.
+
+    When lead_time=1 this is equivalent to the standard single-period model
+    (order at t, available at t+1 — but here we use t-to-t, i.e., immediate
+    delivery). For backward compatibility the caller should pass lead_time=0
+    for same-period delivery; lead_time >= 1 creates a pipeline delay.
+
+    Parameters
+    ----------
+    order_quantities : np.ndarray
+        Planned order quantity for each period (one decision per period).
+    actual_demands : np.ndarray
+        Actual realised demand for each period.
+    lead_time : int
+        Replenishment lead time in periods. 0 = same-period delivery,
+        1 = one-period delay, etc.
+    initial_inventory : float
+        Starting on-hand inventory level.
+    carryover_rate : float
+        Fraction of leftover inventory carried to the next period.
+    capacity : float
+        Maximum warehouse storage capacity.
+    ordering_cost, holding_cost, stockout_cost : float
+        Newsvendor cost parameters.
+
+    Returns
+    -------
+    InventorySimulationResult
+        Simulation results compatible with the rest of the evaluation pipeline.
+
+    Notes
+    -----
+    Orders placed in periods [-lead_time+1, ..., 0] (pre-simulation) are
+    assumed to be 0 (pipeline is empty at start). This is a conservative
+    assumption; practitioners can warm-start by passing initial_inventory > 0.
+    """
+    n_days = len(order_quantities)
+
+    actual_orders    = np.zeros(n_days)
+    inventory_levels = np.zeros(n_days)
+    carryover_inv    = np.zeros(n_days)
+    costs            = np.zeros(n_days)
+    ord_costs        = np.zeros(n_days)
+    hold_costs       = np.zeros(n_days)
+    stock_costs      = np.zeros(n_days)
+    cap_util         = np.zeros(n_days)
+
+    # Pipeline queue: orders_in_transit[t] = quantity arriving at period t
+    # Pre-simulation pipeline is empty (no outstanding orders before start)
+    orders_arriving = np.zeros(n_days + lead_time)
+    for t in range(n_days):
+        arrival_period = t + lead_time
+        if arrival_period < len(orders_arriving):
+            orders_arriving[arrival_period] += order_quantities[t]
+        actual_orders[t] = order_quantities[t]
+
+    inventory = initial_inventory
+    for t in range(n_days):
+        carryover_inv[t] = inventory
+
+        # Orders placed lead_time periods ago arrive now
+        arrived = orders_arriving[t]
+
+        # Clip total available to capacity
+        available = min(inventory + arrived, capacity)
+        inventory_levels[t] = available
+        cap_util[t] = available / capacity if capacity > 0 else 0.0
+
+        # Demand realisation
+        demand = actual_demands[t]
+        overage  = max(0.0, available - demand)
+        underage = max(0.0, demand - available)
+
+        oc = ordering_cost * order_quantities[t]
+        hc = holding_cost * overage
+        sc = stockout_cost * underage
+
+        ord_costs[t]  = oc
+        hold_costs[t] = hc
+        stock_costs[t] = sc
+        costs[t]      = oc + hc + sc
+
+        # Carryover
+        inventory = overage * carryover_rate
+
+    return InventorySimulationResult(
+        actual_orders=actual_orders,
+        inventory_levels=inventory_levels,
+        carryover_inventory=carryover_inv,
+        costs=costs,
+        ordering_costs=ord_costs,
+        holding_costs=hold_costs,
+        stockout_costs=stock_costs,
+        demands=actual_demands.copy(),
+        capacity_utilization=cap_util,
     )
