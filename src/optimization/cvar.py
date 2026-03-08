@@ -1141,6 +1141,217 @@ def compute_inventory_aware_orders_cvar(
     )
 
 
+def compute_inventory_aware_orders_multi_period_cvar(
+    point_pred: Dict[int, np.ndarray],
+    lower: Dict[int, np.ndarray],
+    upper: Dict[int, np.ndarray],
+    horizons: List[int],
+    actual_demands: np.ndarray,
+    initial_inventory: float = 0.0,
+    carryover_rate: float = 0.95,
+    capacity: float = 200.0,
+    beta: float = 0.90,
+    n_samples: int = 1000,
+    ordering_cost: float = 10.0,
+    holding_cost: float = 2.0,
+    stockout_cost: float = 50.0,
+    random_seed: int = 42,
+    verbose: bool = True,
+    aggregation: str = "mean",
+    sl_target: Optional[float] = None,
+) -> 'InventorySimulationResult':
+    """
+    Inventory-aware CVaR optimization using multi-period demand forecasts.
+
+    At each period t the decision-maker:
+      1. Observes current on-hand inventory I_t (from carryover of t-1).
+      2. Generates demand scenarios at each forecast horizon using the
+         multi-period prediction intervals.
+      3. Solves a joint multi-period CVaR LP that considers demand risk
+         across the full planning horizon while accounting for I_t.
+      4. Places the order, demand d_t realises, and carryover propagates.
+
+    By incorporating forecasts for horizons beyond the immediate period,
+    the optimizer can hedge against future demand patterns and make more
+    robust ordering decisions.
+
+    Parameters
+    ----------
+    point_pred : Dict[int, np.ndarray]
+        Point predictions for each horizon. Keys are horizon values (e.g.
+        1, 7, 14, 21, 28), values are arrays of shape (n_days,).
+    lower : Dict[int, np.ndarray]
+        Lower bounds of prediction intervals for each horizon.
+    upper : Dict[int, np.ndarray]
+        Upper bounds of prediction intervals for each horizon.
+    horizons : List[int]
+        List of forecast horizons (days ahead).
+    actual_demands : np.ndarray
+        Actual realized demand for each period (for simulation).
+    initial_inventory : float
+        Starting inventory level.
+    carryover_rate : float
+        Fraction of leftover inventory that carries to next period.
+    capacity : float
+        Maximum warehouse storage capacity.
+    beta : float
+        CVaR level (tail probability).
+    n_samples : int
+        Number of demand samples to generate per horizon per period.
+    ordering_cost, holding_cost, stockout_cost : float
+        Cost parameters.
+    random_seed : int
+        Random seed for reproducibility.
+    verbose : bool
+        Whether to print progress.
+    aggregation : str
+        How to aggregate losses across horizons: "mean", "sum", "worst_case".
+    sl_target : float or None
+        Minimum required service level. When set (e.g. 0.95), enforces
+        I + q >= upper_h1[t] (CQR conformal bound at horizon 1) as a
+        service-level floor in the LP.
+
+    Returns
+    -------
+    InventorySimulationResult
+        Combined optimization + simulation results.
+    """
+    # Use horizon-1 predictions length as the number of test days, falling
+    # back to the shortest horizon's predictions if horizon 1 is absent.
+    ref_horizon = min(horizons)
+    n_days = min(len(point_pred[ref_horizon]), len(actual_demands))
+    inventory = initial_inventory
+
+    if verbose:
+        sl_str = f", SL>={sl_target*100:.0f}%" if sl_target is not None else ""
+        logger.info(
+            f"Multi-period inventory-aware CVaR optimization "
+            f"(beta={beta}{sl_str}, horizons={horizons}, agg={aggregation}) "
+            f"for {n_days} days..."
+        )
+
+    actual_orders = np.zeros(n_days)
+    inventory_levels = np.zeros(n_days)
+    carryover_inv = np.zeros(n_days)
+    costs = np.zeros(n_days)
+    ord_costs = np.zeros(n_days)
+    hold_costs = np.zeros(n_days)
+    stock_costs = np.zeros(n_days)
+    cap_util = np.zeros(n_days)
+
+    c_o, c_h, c_u = ordering_cost, holding_cost, stockout_cost
+    n_horizons = len(horizons)
+
+    for t in range(n_days):
+        carryover_inv[t] = inventory
+
+        # Remaining capacity for new orders
+        max_order = max(0.0, capacity - inventory)
+
+        # Generate demand scenarios for each horizon
+        rng = np.random.RandomState(random_seed + t)
+        demand_scenarios = {}
+        for h in horizons:
+            if t < len(lower[h]) and t < len(upper[h]):
+                demand_scenarios[h] = rng.uniform(lower[h][t], upper[h][t], n_samples)
+            else:
+                # Fallback: use last available forecast
+                idx = min(t, len(lower[h]) - 1)
+                demand_scenarios[h] = rng.uniform(lower[h][idx], upper[h][idx], n_samples)
+
+        # Determine SL bound: use the shortest-horizon CQR upper bound
+        period_sl_bound: Optional[float] = None
+        if sl_target is not None:
+            sl_h = min(horizons)
+            idx = min(t, len(upper[sl_h]) - 1)
+            period_sl_bound = float(upper[sl_h][idx])
+
+        # Solve joint multi-period CVaR LP with inventory awareness
+        # Build LP: single order quantity q optimized over all horizons
+        prob = pulp.LpProblem(f"MP_CVaR_InvAware_t{t}", pulp.LpMinimize)
+
+        q = pulp.LpVariable("q", lowBound=0, upBound=max_order if max_order > 0 else None)
+        tau = pulp.LpVariable("tau")
+        z = [pulp.LpVariable(f"z_{i}", lowBound=0) for i in range(n_samples)]
+
+        # Per-scenario, per-horizon linearization variables
+        h_var = {(i, h_idx): pulp.LpVariable(f"h_{i}_{h_idx}", lowBound=0)
+                 for i in range(n_samples) for h_idx in range(n_horizons)}
+        u_var = {(i, h_idx): pulp.LpVariable(f"u_{i}_{h_idx}", lowBound=0)
+                 for i in range(n_samples) for h_idx in range(n_horizons)}
+
+        # Objective: minimize CVaR = tau + 1/(N*(1-beta)) * sum(z_i)
+        prob += tau + (1.0 / (n_samples * (1.0 - beta))) * pulp.lpSum(z)
+
+        # Constraints per scenario
+        inv = inventory  # current on-hand inventory
+        for i in range(n_samples):
+            for h_idx, horizon in enumerate(horizons):
+                d_ih = float(demand_scenarios[horizon][i])
+                # Overage/underage based on (inventory + order) vs demand
+                prob += h_var[i, h_idx] >= (inv + q) - d_ih
+                prob += u_var[i, h_idx] >= d_ih - (inv + q)
+
+            # Aggregated loss across horizons
+            agg_loss_expr = pulp.lpSum(
+                c_o * q + c_h * h_var[i, h_idx] + c_u * u_var[i, h_idx]
+                for h_idx in range(n_horizons)
+            )
+            if aggregation == "mean":
+                agg_loss_expr = agg_loss_expr / n_horizons
+
+            prob += z[i] >= agg_loss_expr - tau
+
+        # Service-level constraint: I + q >= sl_bound
+        if period_sl_bound is not None:
+            prob += inv + q >= period_sl_bound
+
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+        q_val = pulp.value(q)
+        q_opt = max(0.0, q_val if q_val is not None else 0.0)
+
+        # Apply capacity constraint (defensive)
+        actual_order = max(0.0, min(q_opt, max_order))
+
+        # Available inventory after ordering
+        available = inventory + actual_order
+        inventory_levels[t] = available
+        cap_util[t] = available / capacity if capacity > 0 else 0.0
+
+        # Demand realisation
+        demand = actual_demands[t]
+
+        # Cost components
+        overage = max(0.0, available - demand)
+        underage = max(0.0, demand - available)
+
+        oc = ordering_cost * actual_order
+        hc = holding_cost * overage
+        sc = stockout_cost * underage
+
+        actual_orders[t] = actual_order
+        ord_costs[t] = oc
+        hold_costs[t] = hc
+        stock_costs[t] = sc
+        costs[t] = oc + hc + sc
+
+        # Carryover to next period
+        inventory = overage * carryover_rate
+
+    return InventorySimulationResult(
+        actual_orders=actual_orders,
+        inventory_levels=inventory_levels,
+        carryover_inventory=carryover_inv,
+        costs=costs,
+        ordering_costs=ord_costs,
+        holding_costs=hold_costs,
+        stockout_costs=stock_costs,
+        demands=actual_demands[:n_days].copy(),
+        capacity_utilization=cap_util,
+    )
+
+
 def compute_inventory_aware_orders_dro(
     point_pred: np.ndarray,
     lower: np.ndarray,

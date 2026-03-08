@@ -170,6 +170,28 @@ class EnsembleBatchPIConfig:
     random_state: int = 42
 
 
+@dataclass
+class ConformalPredictiveDistributionConfig:
+    """
+    Conformal Predictive Distribution (CPD) settings.
+
+    Unlike standard conformal prediction that produces symmetric intervals,
+    CPD builds a full predictive distribution from calibration residuals,
+    enabling scenario-based CVaR optimization with asymmetric intervals.
+
+    References
+    ----------
+    - Vovk et al. (2005) "Algorithmic Learning in a Random World"
+    - Vovk et al. (2019) "Conformal Prediction for Reliable Machine Learning"
+    - Chernozhukov et al. (2021) "Distributional conformal prediction"
+    """
+    alpha: float = 0.05  # 1 - alpha = coverage level
+    n_estimators: int = 100  # Trees in the Random Forest
+    max_depth: int = 10  # Maximum tree depth
+    n_scenarios: int = 1000  # Demand scenarios sampled from CPD for CVaR
+    random_state: int = 42
+
+
 # =============================================================================
 # ROLLING WINDOW CONFIGURATION
 # =============================================================================
@@ -269,6 +291,7 @@ class ExperimentConfig:
     mc_dropout: MCDropoutConfig = field(default_factory=MCDropoutConfig)
     tft: TFTConfig = field(default_factory=TFTConfig)
     ensemble_batch_pi: EnsembleBatchPIConfig = field(default_factory=EnsembleBatchPIConfig)
+    cpd: ConformalPredictiveDistributionConfig = field(default_factory=ConformalPredictiveDistributionConfig)
 
     # Experiment settings
     random_seed: int = 42

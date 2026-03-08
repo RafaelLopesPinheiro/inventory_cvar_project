@@ -2079,3 +2079,239 @@ class Seer(BaseForecaster):
         # With perfect foresight, order exactly the demand
         # This minimizes holding (0) and stockout (0) costs
         return y_actual.copy()
+
+
+# =============================================================================
+# CONFORMAL PREDICTIVE DISTRIBUTION (CPD)
+# =============================================================================
+
+class ConformalPredictiveDistribution(BaseForecaster):
+    """
+    Conformal Predictive Distribution for inventory optimization.
+
+    Unlike standard conformal prediction which outputs symmetric intervals,
+    CPD produces a full predictive distribution by treating calibration residuals
+    as exchangeable samples from the noise distribution.  For each test point x,
+    the predictive distribution is:
+
+        F̂(y | x) = (1 / n_cal) * Σ_{i=1}^{n_cal} I(ŷ(x) + ε_i ≤ y)
+
+    where ε_i = y_cal_i - ŷ(x_cal_i) are the signed calibration residuals and
+    ŷ is a point predictor (Random Forest).
+
+    This approach has several advantages over interval-based methods:
+    1. **Full distribution**: Captures the entire shape of demand uncertainty
+       (skewness, heavy tails) rather than reducing it to two bounds.
+    2. **Scenario-based CVaR**: The residual-based scenarios feed directly into
+       the CVaR LP, avoiding the uniform distribution assumption of interval
+       methods.  This is the same insight behind SPO's residual scenarios but
+       with a proper conformal framework.
+    3. **Asymmetric intervals**: The prediction intervals derived from the
+       empirical quantiles of the CPD are asymmetric, adapting to the actual
+       residual distribution (e.g., right-skewed demand).
+    4. **Finite-sample coverage**: Inherits the marginal coverage guarantee
+       of conformal prediction: P(Y ∈ [q_{α/2}, q_{1-α/2}]) ≥ 1 - α.
+
+    The method:
+    1. Train a Random Forest on X_train, y_train.
+    2. Compute signed residuals on calibration data: ε_i = y_cal_i - ŷ_cal_i.
+    3. For each test point, the predictive distribution is ŷ + ε (all cal residuals).
+    4. Extract prediction intervals as empirical quantiles of the CPD.
+    5. Supply the full residual set to the CVaR optimizer as demand scenarios.
+
+    References
+    ----------
+    - Vovk et al. (2005) "Algorithmic Learning in a Random World"
+    - Vovk et al. (2019) "Conformal Prediction for Reliable Machine Learning"
+    - Chernozhukov et al. (2021) "Distributional conformal prediction"
+    - Romano et al. (2019) "Conformalized Quantile Regression"
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.05,
+        n_estimators: int = 100,
+        max_depth: int = 10,
+        n_scenarios: int = 1000,
+        random_state: int = 42,
+    ):
+        """
+        Parameters
+        ----------
+        alpha : float
+            Significance level for prediction intervals (1 - alpha coverage).
+        n_estimators : int
+            Number of trees in the Random Forest.
+        max_depth : int
+            Maximum depth of each tree.
+        n_scenarios : int
+            Number of scenarios to generate for CVaR optimization.
+            If n_scenarios <= n_cal, a random subsample of residuals is used.
+            If n_scenarios > n_cal, residuals are sampled with replacement.
+        random_state : int
+            Random seed for reproducibility.
+        """
+        super().__init__(alpha=alpha, random_state=random_state)
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.n_scenarios = n_scenarios
+
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+
+        # Stored after fit
+        self.residuals_: Optional[np.ndarray] = None  # signed residuals
+        self.q_lower_: Optional[float] = None
+        self.q_upper_: Optional[float] = None
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+    ) -> "ConformalPredictiveDistribution":
+        """
+        Train point predictor and compute calibration residuals.
+
+        Parameters
+        ----------
+        X_train, y_train : Training data.
+        X_cal, y_cal : Calibration data (used for residual computation).
+
+        Returns
+        -------
+        self
+        """
+        logger.info("Training Conformal Predictive Distribution model...")
+
+        # 1. Train point predictor
+        self.model.fit(X_train, y_train)
+
+        # 2. Compute signed calibration residuals
+        cal_pred = self.model.predict(X_cal)
+        self.residuals_ = y_cal - cal_pred  # signed (preserves skewness)
+
+        # 3. Compute conformal quantiles for interval construction
+        n = len(y_cal)
+        quantile_level = min(np.ceil((n + 1) * (1 - self.alpha)) / n, 1.0)
+        lower_q = (1.0 - quantile_level) / 2.0
+        upper_q = 1.0 - lower_q
+
+        self.q_lower_ = np.quantile(self.residuals_, lower_q)
+        self.q_upper_ = np.quantile(self.residuals_, upper_q)
+
+        logger.info(
+            f"CPD calibrated: {n} residuals, "
+            f"interval quantiles [{self.q_lower_:.3f}, {self.q_upper_:.3f}], "
+            f"residual mean={self.residuals_.mean():.3f}, "
+            f"std={self.residuals_.std():.3f}, "
+            f"skew={float(np.mean(((self.residuals_ - self.residuals_.mean()) / (self.residuals_.std() + 1e-8)) ** 3)):.3f}"
+        )
+
+        self._is_fitted = True
+        return self
+
+    def predict(self, X: np.ndarray) -> PredictionResult:
+        """
+        Generate predictions with asymmetric conformal intervals.
+
+        The intervals are derived from the empirical quantiles of the full
+        conformal predictive distribution, not from symmetric non-conformity
+        scores.  This produces tighter, asymmetric intervals when the
+        residual distribution is skewed.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Features for prediction.
+
+        Returns
+        -------
+        PredictionResult
+            Point predictions with asymmetric prediction intervals.
+        """
+        self._check_is_fitted()
+
+        point_pred = self.model.predict(X)
+
+        # Asymmetric intervals from the CPD quantiles
+        lower = point_pred + self.q_lower_  # q_lower_ is typically negative
+        upper = point_pred + self.q_upper_  # q_upper_ is typically positive
+
+        return PredictionResult(point=point_pred, lower=lower, upper=upper)
+
+    def get_residuals(self) -> np.ndarray:
+        """
+        Return the signed calibration residuals.
+
+        These residuals serve as the scenario pool for CVaR optimization.
+        The CVaR optimizer can generate demand scenarios as:
+            D_t^(s) = max(0, ŷ_t + ε_s)
+
+        Returns
+        -------
+        np.ndarray
+            Signed calibration residuals (y_cal - ŷ_cal).
+        """
+        self._check_is_fitted()
+        return self.residuals_.copy()
+
+    def sample_scenarios(
+        self,
+        point_pred: np.ndarray,
+        n_scenarios: Optional[int] = None,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> np.ndarray:
+        """
+        Sample demand scenarios from the conformal predictive distribution.
+
+        For each test point t, generates n_scenarios demand realizations:
+            D_t^(s) = max(0, ŷ_t + ε_s),  s = 1, ..., n_scenarios
+
+        where ε_s are drawn (with replacement) from the calibration residuals.
+
+        Parameters
+        ----------
+        point_pred : np.ndarray, shape (n_test,)
+            Point predictions for test points.
+        n_scenarios : int or None
+            Number of scenarios to generate.  Defaults to self.n_scenarios.
+        rng : np.random.RandomState or None
+            Random state for reproducibility.
+
+        Returns
+        -------
+        np.ndarray, shape (n_test, n_scenarios)
+            Demand scenario matrix.
+        """
+        self._check_is_fitted()
+        if n_scenarios is None:
+            n_scenarios = self.n_scenarios
+        if rng is None:
+            rng = np.random.RandomState(self.random_state)
+
+        n_test = len(point_pred)
+        # Sample residuals with replacement
+        idx = rng.choice(len(self.residuals_), size=n_scenarios, replace=True)
+        sampled_residuals = self.residuals_[idx]  # (n_scenarios,)
+
+        # Broadcast: (n_test, 1) + (1, n_scenarios) -> (n_test, n_scenarios)
+        scenarios = point_pred[:, None] + sampled_residuals[None, :]
+        return np.maximum(0.0, scenarios)
+
+    def get_params(self) -> dict:
+        params = super().get_params()
+        params.update({
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "n_scenarios": self.n_scenarios,
+            "q_lower": self.q_lower_,
+            "q_upper": self.q_upper_,
+            "n_residuals": len(self.residuals_) if self.residuals_ is not None else 0,
+        })
+        return params

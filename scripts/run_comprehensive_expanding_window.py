@@ -13,21 +13,23 @@ Unlike the standard single-period newsvendor, this experiment models:
 - Capacity: Warehouse has a maximum storage limit
 - Sequential decisions: Each period's order depends on current inventory state
 
-MODEL HIERARCHY (8 Methods + simple policy benchmark):
+MODEL HIERARCHY (9 Methods + simple policy benchmark):
 =======================================================
-Methods 1-5 use Random Forest as the base predictor to equalize the effect of
-model architecture vs. the uncertainty/optimization method.  Method 6 uses an
-LSTM neural network to assess the benefit of deep sequence modelling.
+Methods 1-5, 10 use Random Forest as the base predictor to equalize the effect
+of model architecture vs. the uncertainty/optimization method.  Method 6 uses
+an LSTM neural network to assess the benefit of deep sequence modelling.
 
-0. (s,S) Policy        - Simple rule-based reorder benchmark (no forecasting)
-1. SAA                 - Sample Average Approximation (OR benchmark)
-2. Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
-3. Wasserstein DRO     - Distributionally Robust Optimization
-4. EnbPI+CQR+CVaR(SL95)- Ensemble Batch PI + CQR + CVaR with explicit SL>=95% constraint
-5. SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
-6. LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
-7. Seer               - Oracle upper bound (perfect foresight)
-8. CQR+SPO (Hybrid)   - EnbPI+CQR intervals + SPO residual-based CVaR scenarios
+0.  (s,S) Policy        - Simple rule-based reorder benchmark (no forecasting)
+1.  SAA                 - Sample Average Approximation (OR benchmark)
+2.  Conformal + CVaR    - Conformal Prediction intervals + CVaR optimization
+3.  Wasserstein DRO     - Distributionally Robust Optimization
+4.  EnbPI+CQR+CVaR(SL95)- Ensemble Batch PI + CQR + CVaR with explicit SL>=95% constraint
+5.  SPO (RF, CVaR)      - Smart Predict-then-Optimize with RF base + CVaR optimization
+6.  LSTM+Conformal+CVaR - LSTM quantile regression + conformal calibration + CVaR
+7.  Seer               - Oracle upper bound (perfect foresight)
+8.  CQR+SPO (Hybrid)   - EnbPI+CQR intervals + SPO residual-based CVaR scenarios
+9.  MultiPeriod CQR+CVaR- Multi-horizon joint optimization
+10. CPD+CVaR           - Conformal Predictive Distribution + CVaR (full distributional)
 
 EVALUATION:
 ===========
@@ -86,6 +88,7 @@ from src.data import (
     filter_store_item,
     create_all_features,
     create_rolling_window_splits,
+    create_multi_period_targets,
     RollingWindowSplit,
 )
 from src.models import (
@@ -94,13 +97,16 @@ from src.models import (
     EnsembleBatchPI,
     DistributionallyRobustOptimization,
     SPORandomForest,
+    ConformalPredictiveDistribution,
     Seer,
     LSTMQuantileRegression,
     PredictionResult,
+    MultiPeriodForecaster,
 )
 from src.optimization import (
     compute_order_quantities_cvar,
     compute_inventory_aware_orders_cvar,
+    compute_inventory_aware_orders_multi_period_cvar,
     compute_inventory_aware_orders_dro,
     CostParameters,
     simulate_inventory_with_carryover,
@@ -138,12 +144,17 @@ MODEL_CATEGORIES = {
     "6_DeepLearning": ["LSTM_Conformal_CVaR"],
     "7_Oracle": ["Seer"],
     "8_HybridCQR_SPO": ["CQR_SPO"],
+    "9_MultiPeriod": ["MultiPeriod_CQR_CVaR"],
+    "10_ConformalPredDist": ["CPD_CVaR"],
+    "11_MultiPeriodCPD": ["MultiPeriod_CPD_CVaR"],
+    "12_MultiPeriodConformal": ["MultiPeriod_Conformal_CVaR"],
 }
 
 MODEL_ORDER = [
     'sS_Policy', 'SAA', 'Conformal_CVaR', 'Wasserstein_DRO',
     'EnbPI_CQR_CVaR', 'SPO_EndToEnd', 'LSTM_Conformal_CVaR', 'Seer',
-    'CQR_SPO',
+    'CQR_SPO', 'MultiPeriod_CQR_CVaR', 'CPD_CVaR', 'MultiPeriod_CPD_CVaR',
+    'MultiPeriod_Conformal_CVaR',
 ]
 
 MODEL_DISPLAY_NAMES = {
@@ -156,6 +167,10 @@ MODEL_DISPLAY_NAMES = {
     "LSTM_Conformal_CVaR": "6. LSTM+Conformal+CVaR",
     "Seer": "7. Seer (Oracle)",
     "CQR_SPO": "8. CQR+SPO (Hybrid)",
+    "MultiPeriod_CQR_CVaR": "9. MultiPeriod CQR+CVaR",
+    "CPD_CVaR": "10. CPD+CVaR",
+    "MultiPeriod_CPD_CVaR": "11. MultiPeriod CPD+CVaR",
+    "MultiPeriod_Conformal_CVaR": "12. MultiPeriod Conformal+CVaR",
 }
 
 MODEL_COLORS = {
@@ -168,6 +183,10 @@ MODEL_COLORS = {
     "LSTM_Conformal_CVaR": "#17becf",
     "Seer": "#2ca02c",
     "CQR_SPO": "#bcbd22",
+    "MultiPeriod_CQR_CVaR": "#7f7f7f",
+    "CPD_CVaR": "#ff6347",
+    "MultiPeriod_CPD_CVaR": "#20b2aa",
+    "MultiPeriod_Conformal_CVaR": "#daa520",
 }
 
 
@@ -698,6 +717,287 @@ def run_single_window(
             }
     except Exception as e:
         logger.debug(f"CQR+SPO hybrid failed: {e}")
+
+    # =========================================================================
+    # 10. CONFORMAL PREDICTIVE DISTRIBUTION + CVaR
+    #
+    # Unlike standard conformal prediction (method 2) which produces symmetric
+    # intervals and samples scenarios uniformly within [lower, upper], CPD
+    # builds a full predictive distribution from calibration residuals.
+    #
+    # Advantages over Conformal+CVaR (method 2):
+    #   - Asymmetric intervals that capture skewed demand distributions
+    #   - Scenario-based CVaR uses actual residual distribution (not uniform)
+    #   - Better tail-risk estimation when demand is heavy-tailed or skewed
+    #
+    # Similar to CQR+SPO (method 8) in using residual-based scenarios, but:
+    #   - Uses its own dedicated model (not re-using EnbPI from method 4)
+    #   - Intervals come from the CPD quantiles (asymmetric by construction)
+    #   - The full predictive distribution is a principled conformal object
+    # =========================================================================
+    try:
+        start_time = time.time()
+
+        cpd_model = ConformalPredictiveDistribution(
+            alpha=config.cpd.alpha,
+            n_estimators=config.cpd.n_estimators,
+            max_depth=config.cpd.max_depth,
+            n_scenarios=config.cpd.n_scenarios,
+            random_state=config.random_seed,
+        )
+        cpd_model.fit(X_train, y_train, X_cal, y_cal)
+        cpd_pred = cpd_model.predict(X_test)
+
+        # Use the CPD residuals as demand scenarios in the CVaR LP.
+        # This is the key differentiator: the optimizer sees the actual
+        # empirical distribution of demand errors, not a uniform
+        # approximation.
+        cpd_residuals = cpd_model.get_residuals()
+
+        cpd_sim = compute_inventory_aware_orders_cvar(
+            cpd_pred.point, cpd_pred.lower, cpd_pred.upper,
+            actual_demands=y_test,
+            initial_inventory=costs.initial_inventory,
+            carryover_rate=costs.carryover_rate,
+            capacity=costs.capacity,
+            beta=config.cvar.beta, n_samples=config.cvar.n_samples,
+            ordering_cost=costs.ordering_cost, holding_cost=costs.holding_cost,
+            stockout_cost=costs.stockout_cost, random_seed=config.cvar.random_seed,
+            verbose=False,
+            demand_residuals=cpd_residuals,
+        )
+        cpd_orders = cpd_sim.actual_orders
+
+        timings["CPD_CVaR"] = time.time() - start_time
+        sim_results["CPD_CVaR"] = cpd_sim
+        results["CPD_CVaR"] = {
+            'pred': cpd_pred, 'target_orders': cpd_orders,
+            'sim': cpd_sim, 'time': timings["CPD_CVaR"]
+        }
+    except Exception as e:
+        logger.debug(f"CPD+CVaR failed: {e}")
+
+    # =========================================================================
+    # 9. MULTI-PERIOD EnbPI+CQR+CVaR (Joint horizon optimization)
+    #
+    # Uses the MultiPeriodForecaster to train separate EnsembleBatchPI models
+    # for each forecast horizon (e.g. 1, 7, 14, 21, 28 days ahead).  The
+    # inventory-aware CVaR LP then jointly optimizes the order quantity by
+    # considering demand risk across the full planning horizon, rather than
+    # only the immediate next-day forecast.
+    #
+    # This enables the optimizer to "look ahead" and hedge against future
+    # demand patterns, producing more robust ordering decisions.
+    # =========================================================================
+    if config.multi_period.enabled:
+        try:
+            start_time = time.time()
+            mp_horizons = config.multi_period.forecast_horizons
+            max_horizon = max(mp_horizons)
+
+            # Build multi-period targets from the raw demand series.
+            # We need contiguous demand extending beyond each split to create
+            # shifted targets for each horizon.
+            y_train_full = np.concatenate([
+                y_train,
+                y_cal[:max_horizon]  # extra for target creation
+            ])
+            y_cal_full = np.concatenate([
+                y_cal,
+                y_test[:min(max_horizon, len(y_test))]
+            ])
+
+            mp_y_train = create_multi_period_targets(y_train_full, mp_horizons)
+            mp_y_cal = create_multi_period_targets(y_cal_full, mp_horizons)
+
+            # Truncate features to match the target length (targets lose
+            # max_horizon samples from the end due to the forward shift).
+            n_train_mp = len(mp_y_train[mp_horizons[0]])
+            n_cal_mp = len(mp_y_cal[mp_horizons[0]])
+
+            X_train_mp = X_train[:n_train_mp]
+            X_cal_mp = X_cal[:n_cal_mp]
+            X_test_mp = X_test  # test features remain full length
+
+            # Train a MultiPeriodForecaster (one EnsembleBatchPI per horizon)
+            mp_forecaster = MultiPeriodForecaster(
+                base_model_class=EnsembleBatchPI,
+                horizons=mp_horizons,
+                alpha=config.ensemble_batch_pi.alpha,
+                n_ensemble=config.ensemble_batch_pi.n_ensemble,
+                n_estimators=config.ensemble_batch_pi.n_estimators,
+                max_depth=config.ensemble_batch_pi.max_depth,
+                bootstrap_fraction=config.ensemble_batch_pi.bootstrap_fraction,
+                use_quantile_regression=config.ensemble_batch_pi.use_quantile_regression,
+                random_state=config.random_seed,
+            )
+            mp_forecaster.fit(X_train_mp, mp_y_train, X_cal_mp, mp_y_cal)
+            mp_pred = mp_forecaster.predict(X_test_mp)
+
+            # Extract per-horizon prediction dicts for the optimizer
+            mp_point = {h: mp_pred.predictions[h].point for h in mp_horizons}
+            mp_lower = {h: mp_pred.predictions[h].lower for h in mp_horizons}
+            mp_upper = {h: mp_pred.predictions[h].upper for h in mp_horizons}
+
+            # Run inventory-aware multi-period CVaR optimization
+            mp_sim = compute_inventory_aware_orders_multi_period_cvar(
+                point_pred=mp_point,
+                lower=mp_lower,
+                upper=mp_upper,
+                horizons=mp_horizons,
+                actual_demands=y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
+                beta=config.cvar.beta,
+                n_samples=config.cvar.n_samples,
+                ordering_cost=costs.ordering_cost,
+                holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost,
+                random_seed=config.cvar.random_seed,
+                verbose=False,
+                aggregation=config.multi_period.aggregation,
+                sl_target=0.95,
+            )
+
+            # For forecast evaluation, use the horizon-1 predictions (most
+            # comparable to single-period methods).
+            h1 = min(mp_horizons)
+            mp_eval_pred = mp_pred.predictions[h1]
+
+            timings["MultiPeriod_CQR_CVaR"] = time.time() - start_time
+            sim_results["MultiPeriod_CQR_CVaR"] = mp_sim
+            results["MultiPeriod_CQR_CVaR"] = {
+                'pred': mp_eval_pred,
+                'target_orders': mp_sim.actual_orders,
+                'sim': mp_sim,
+                'time': timings["MultiPeriod_CQR_CVaR"],
+            }
+        except Exception as e:
+            logger.debug(f"MultiPeriod CQR+CVaR failed: {e}")
+
+        # =====================================================================
+        # 11. MULTI-PERIOD CPD+CVaR (Joint horizon optimization with CPD)
+        #
+        # Multi-period variant of CPD+CVaR (method 10).  Uses one CPD model
+        # per forecast horizon via MultiPeriodForecaster, then jointly
+        # optimizes the order quantity across all horizons.
+        #
+        # Advantage over MultiPeriod CQR+CVaR (method 9): the CPD provides
+        # a full distributional forecast at each horizon, enabling richer
+        # scenario-based optimization (not limited to interval bounds).
+        # =====================================================================
+        try:
+            start_time = time.time()
+
+            # Re-use the multi-period targets already built for method 9
+            mp_cpd_forecaster = MultiPeriodForecaster(
+                base_model_class=ConformalPredictiveDistribution,
+                horizons=mp_horizons,
+                alpha=config.cpd.alpha,
+                n_estimators=config.cpd.n_estimators,
+                max_depth=config.cpd.max_depth,
+                n_scenarios=config.cpd.n_scenarios,
+                random_state=config.random_seed,
+            )
+            mp_cpd_forecaster.fit(X_train_mp, mp_y_train, X_cal_mp, mp_y_cal)
+            mp_cpd_pred = mp_cpd_forecaster.predict(X_test_mp)
+
+            # Extract per-horizon predictions
+            mp_cpd_point = {h: mp_cpd_pred.predictions[h].point for h in mp_horizons}
+            mp_cpd_lower = {h: mp_cpd_pred.predictions[h].lower for h in mp_horizons}
+            mp_cpd_upper = {h: mp_cpd_pred.predictions[h].upper for h in mp_horizons}
+
+            # Run multi-period CVaR optimization
+            mp_cpd_sim = compute_inventory_aware_orders_multi_period_cvar(
+                point_pred=mp_cpd_point,
+                lower=mp_cpd_lower,
+                upper=mp_cpd_upper,
+                horizons=mp_horizons,
+                actual_demands=y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
+                beta=config.cvar.beta,
+                n_samples=config.cvar.n_samples,
+                ordering_cost=costs.ordering_cost,
+                holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost,
+                random_seed=config.cvar.random_seed,
+                verbose=False,
+                aggregation=config.multi_period.aggregation,
+            )
+
+            h1 = min(mp_horizons)
+            mp_cpd_eval_pred = mp_cpd_pred.predictions[h1]
+
+            timings["MultiPeriod_CPD_CVaR"] = time.time() - start_time
+            sim_results["MultiPeriod_CPD_CVaR"] = mp_cpd_sim
+            results["MultiPeriod_CPD_CVaR"] = {
+                'pred': mp_cpd_eval_pred,
+                'target_orders': mp_cpd_sim.actual_orders,
+                'sim': mp_cpd_sim,
+                'time': timings["MultiPeriod_CPD_CVaR"],
+            }
+        except Exception as e:
+            logger.debug(f"MultiPeriod CPD+CVaR failed: {e}")
+
+        # =====================================================================
+        # 12. MULTI-PERIOD Conformal+CVaR
+        #
+        # Multi-period variant of method 2 (Conformal+CVaR).  Uses one
+        # ConformalPrediction model per horizon via MultiPeriodForecaster.
+        # =====================================================================
+        try:
+            start_time = time.time()
+
+            mp_cp_forecaster = MultiPeriodForecaster(
+                base_model_class=ConformalPrediction,
+                horizons=mp_horizons,
+                alpha=config.conformal.alpha,
+                n_estimators=config.conformal.n_estimators,
+                max_depth=config.conformal.max_depth,
+                random_state=config.random_seed,
+            )
+            mp_cp_forecaster.fit(X_train_mp, mp_y_train, X_cal_mp, mp_y_cal)
+            mp_cp_pred = mp_cp_forecaster.predict(X_test_mp)
+
+            mp_cp_point = {h: mp_cp_pred.predictions[h].point for h in mp_horizons}
+            mp_cp_lower = {h: mp_cp_pred.predictions[h].lower for h in mp_horizons}
+            mp_cp_upper = {h: mp_cp_pred.predictions[h].upper for h in mp_horizons}
+
+            mp_cp_sim = compute_inventory_aware_orders_multi_period_cvar(
+                point_pred=mp_cp_point,
+                lower=mp_cp_lower,
+                upper=mp_cp_upper,
+                horizons=mp_horizons,
+                actual_demands=y_test,
+                initial_inventory=costs.initial_inventory,
+                carryover_rate=costs.carryover_rate,
+                capacity=costs.capacity,
+                beta=config.cvar.beta,
+                n_samples=config.cvar.n_samples,
+                ordering_cost=costs.ordering_cost,
+                holding_cost=costs.holding_cost,
+                stockout_cost=costs.stockout_cost,
+                random_seed=config.cvar.random_seed,
+                verbose=False,
+                aggregation=config.multi_period.aggregation,
+            )
+
+            h1 = min(mp_horizons)
+            mp_cp_eval_pred = mp_cp_pred.predictions[h1]
+
+            timings["MultiPeriod_Conformal_CVaR"] = time.time() - start_time
+            sim_results["MultiPeriod_Conformal_CVaR"] = mp_cp_sim
+            results["MultiPeriod_Conformal_CVaR"] = {
+                'pred': mp_cp_eval_pred,
+                'target_orders': mp_cp_sim.actual_orders,
+                'sim': mp_cp_sim,
+                'time': timings["MultiPeriod_Conformal_CVaR"],
+            }
+        except Exception as e:
+            logger.debug(f"MultiPeriod Conformal+CVaR failed: {e}")
 
     # =========================================================================
     # 6. LSTM + CONFORMAL + CVaR  (Deep-Learning method)
@@ -1661,6 +1961,22 @@ def create_summary_report(
         if 'EnbPI_CQR_CVaR' in mean_costs and 'CQR_SPO' in mean_costs:
             imp = (mean_costs['EnbPI_CQR_CVaR'] - mean_costs['CQR_SPO']) / mean_costs['EnbPI_CQR_CVaR'] * 100
             report.append(f"  vs EnbPI+CQR+CVaR:   {imp:+.1f}%")
+
+    # CPD+CVaR performance
+    if 'CPD_CVaR' in combined_df['Method'].values:
+        report.append(f"\n[CPD+CVaR — Conformal Predictive Distribution + CVaR]")
+        cpd_df = combined_df[combined_df['Method'] == 'CPD_CVaR']
+        report.append(f"  Mean Cost:           ${cpd_df['Mean_Cost'].mean():.2f}")
+        report.append(f"  CVaR-90:             ${cpd_df['CVaR_90'].mean():.2f}")
+        report.append(f"  Service Level:       {cpd_df['Service_Level'].mean()*100:.1f}%")
+        report.append(f"  Capacity Util:       {cpd_df['Avg_Capacity_Util'].mean()*100:.1f}%")
+        report.append(f"  Avg Carryover:       {cpd_df['Avg_Carryover'].mean():.1f} units")
+        if 'Conformal_CVaR' in mean_costs and 'CPD_CVaR' in mean_costs:
+            imp = (mean_costs['Conformal_CVaR'] - mean_costs['CPD_CVaR']) / mean_costs['Conformal_CVaR'] * 100
+            report.append(f"  vs Conformal+CVaR:   {imp:+.1f}%")
+        if 'CQR_SPO' in mean_costs and 'CPD_CVaR' in mean_costs:
+            imp = (mean_costs['CQR_SPO'] - mean_costs['CPD_CVaR']) / mean_costs['CQR_SPO'] * 100
+            report.append(f"  vs CQR+SPO:          {imp:+.1f}%")
 
     # (s,S) policy — simple reorder benchmark
     if 'sS_Policy' in combined_df['Method'].values:
