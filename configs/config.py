@@ -22,7 +22,7 @@ class CostConfig:
 
     # Inventory dynamics
     carryover_rate: float = 0.95  # Fraction of leftover inventory that carries to next period (0=no carryover, 1=full)
-    capacity: float = 200.0  # Maximum warehouse storage capacity (units)
+    capacity: float = 80.0  # Maximum warehouse storage capacity (units)
     initial_inventory: float = 0.0  # Starting inventory level
 
     @property
