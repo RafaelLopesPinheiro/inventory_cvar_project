@@ -12,6 +12,7 @@ from .cvar import (
     compute_order_quantities_dro,
     # Inventory-aware sequential optimization
     compute_inventory_aware_orders_cvar,
+    compute_inventory_aware_orders_multi_period_cvar,
     compute_inventory_aware_orders_dro,
     # Multi-period optimization
     multi_period_newsvendor_loss,
@@ -39,6 +40,7 @@ __all__ = [
     "compute_order_quantities_dro",
     # Inventory-aware sequential optimization
     "compute_inventory_aware_orders_cvar",
+    "compute_inventory_aware_orders_multi_period_cvar",
     "compute_inventory_aware_orders_dro",
     # Multi-period optimization
     "multi_period_newsvendor_loss",

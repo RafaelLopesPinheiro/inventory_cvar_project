@@ -26,6 +26,8 @@ from .traditional import (
     DistributionallyRobustOptimization,
     # SPO with RF base
     SPORandomForest,
+    # Conformal Predictive Distribution
+    ConformalPredictiveDistribution,
     # Utilities
     ExpectedValue,
     Seer,
@@ -66,6 +68,7 @@ __all__ = [
     "EnsembleBatchPI",          # EnbPI+CQR
     "DistributionallyRobustOptimization",  # Wasserstein DRO
     "SPORandomForest",              # SPO with RF base
+    "ConformalPredictiveDistribution",  # CPD
     "ExpectedValue",
     "Seer",
 
